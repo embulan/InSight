@@ -2,3 +2,6 @@ numpy>=1.24
 Pillow>=10.0
 opencv-python-headless>=4.8
 scikit-image>=0.21
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+elevenlabs>=1.0.0
