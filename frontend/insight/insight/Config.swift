@@ -14,6 +14,9 @@ enum Config {
     /// Production:                "wss://api.yourapp.com/ws"
     static let backendWebSocketURL = URL(string: "wss://echo.websocket.org")!
 
+    /// Set this when the backend requires a named WebSocket subprotocol.
+    static let backendWebSocketSubprotocol: String? = nil
+
     // -------------------------------------------------------------------------
     // MARK: Camera
     // -------------------------------------------------------------------------

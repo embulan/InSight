@@ -1,44 +1,69 @@
 import Foundation
 import Combine
 
-final class BackendSocketClient: NSObject, ObservableObject {
+final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocketDelegate {
+    private enum ConnectionState {
+        case disconnected
+        case connecting
+        case connected
+    }
+
     private var session: URLSession?
     private var socketTask: URLSessionWebSocketTask?
+    private var connectionState: ConnectionState = .disconnected
+    private var pendingMessages: [URLSessionWebSocketTask.Message] = []
+    private let decoder = JSONDecoder()
 
     var onEvent: ((IncomingBackendEvent) -> Void)?
 
     func connect(url: URL) {
+        disconnect()
+
         let configuration = URLSessionConfiguration.default
-        session = URLSession(configuration: configuration)
-        socketTask = session?.webSocketTask(with: url)
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+
+        var request = URLRequest(url: url)
+        if let subprotocol = Config.backendWebSocketSubprotocol {
+            request.setValue(subprotocol, forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        }
+
+        socketTask = session?.webSocketTask(with: request)
+        connectionState = .connecting
         socketTask?.resume()
         receiveLoop()
     }
 
     func disconnect() {
+        pendingMessages.removeAll()
+        connectionState = .disconnected
         socketTask?.cancel(with: .normalClosure, reason: nil)
         socketTask = nil
+        session?.invalidateAndCancel()
         session = nil
     }
 
     func sendFrame(_ jpegData: Data) {
-        sendJSON(OutgoingFrameMessage(
-            type: "frame",
-            timestampMs: now(),
-            jpegBase64: jpegData.base64EncodedString()
-        ))
+        sendJSONObject([
+            "type": "frame",
+            "timestampMs": now(),
+            "jpegBase64": jpegData.base64EncodedString()
+        ])
     }
 
     func sendAudio(_ pcmData: Data, sampleRate: Double) {
-        sendJSON(OutgoingAudioMessage(
-            timestampMs: now(),
-            sampleRate: Int(sampleRate),
-            pcmBase64: pcmData.base64EncodedString()
-        ))
+        sendJSONObject([
+            "type": "audio",
+            "timestampMs": now(),
+            "sampleRate": Int(sampleRate),
+            "pcmBase64": pcmData.base64EncodedString()
+        ])
     }
 
     func sendSubmit() {
-        sendJSON(OutgoingSubmitMessage(timestampMs: now()))
+        sendJSONObject([
+            "type": "submit",
+            "timestampMs": now()
+        ])
         if Config.verboseLogging { print("WebSocket: submit sent") }
     }
 
@@ -48,15 +73,41 @@ final class BackendSocketClient: NSObject, ObservableObject {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
-    private func sendJSON<T: Encodable>(_ value: T) {
+    private func sendJSONObject(_ object: [String: Any]) {
         do {
-            let data = try JSONEncoder().encode(value)
+            let data = try JSONSerialization.data(withJSONObject: object, options: [])
             let text = String(decoding: data, as: UTF8.self)
-            socketTask?.send(.string(text)) { error in
-                if let error { print("WebSocket send error: \(error)") }
-            }
+            if Config.verboseLogging { print("WebSocket send:", text) }
+            enqueueOrSend(.string(text))
         } catch {
             print("WebSocket encode error: \(error)")
+        }
+    }
+
+    private func enqueueOrSend(_ message: URLSessionWebSocketTask.Message) {
+        guard let socketTask else {
+            if Config.verboseLogging { print("WebSocket send dropped: no active task") }
+            return
+        }
+
+        guard connectionState == .connected else {
+            pendingMessages.append(message)
+            if Config.verboseLogging { print("WebSocket send queued until connection opens") }
+            return
+        }
+
+        socketTask.send(message) { error in
+            if let error { print("WebSocket send error: \(error)") }
+        }
+    }
+
+    private func flushPendingMessages() {
+        guard connectionState == .connected else { return }
+
+        let messages = pendingMessages
+        pendingMessages.removeAll()
+        for message in messages {
+            enqueueOrSend(message)
         }
     }
 
@@ -64,6 +115,7 @@ final class BackendSocketClient: NSObject, ObservableObject {
         socketTask?.receive { [weak self] result in
             switch result {
             case .failure(let error):
+                self?.connectionState = .disconnected
                 print("WebSocket receive error: \(error)")
 
             case .success(let message):
@@ -87,13 +139,40 @@ final class BackendSocketClient: NSObject, ObservableObject {
     }
 
     private func handleData(_ data: Data) {
-        do {
-            let event = try JSONDecoder().decode(IncomingBackendEvent.self, from: data)
-            DispatchQueue.main.async {
-                self.onEvent?(event)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            do {
+                let event = try decoder.decode(IncomingBackendEvent.self, from: data)
+                onEvent?(event)
+            } catch {
+                print("Backend decode error: \(error)")
             }
-        } catch {
-            print("Backend decode error: \(error)")
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didOpenWithProtocol `protocol`: String?
+    ) {
+        connectionState = .connected
+        if Config.verboseLogging {
+            print("WebSocket connected. Negotiated protocol:", `protocol` ?? "none")
+        }
+        flushPendingMessages()
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+        reason: Data?
+    ) {
+        connectionState = .disconnected
+        if Config.verboseLogging {
+            let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
+            print("WebSocket closed:", closeCode.rawValue, "reason:", reasonText)
         }
     }
 }
