@@ -61,6 +61,11 @@ _DEFAULT_TIMEOUT_MS = 120_000
 _MAX_RETRIES        = 3
 _RETRY_DELAY_SEC    = 1.0
 
+# Minimum seconds between Gemini calls. Prevents quota drain when frames
+# arrive faster than Gemini can respond.
+MIN_GEMINI_INTERVAL_SEC: float = 8.0
+_last_gemini_call_time:  float = 0.0
+
 AMBIENT_INTERVAL_SEC = 5.0   # how often ambient descriptions are spoken
 _last_ambient_time   = 0.0
 
@@ -247,7 +252,22 @@ def analyze_image(
     *,
     model: str = MODEL,
     max_retries: int = _MAX_RETRIES,
-) -> str:
+) -> str | None:
+    """
+    Call Gemini vision on *image_path* and return the model's text.
+
+    Returns None (without raising) when the inter-call throttle is active.
+    Raises RuntimeError immediately for quota (429) and auth (400) errors
+    since retrying those is always wasteful.
+    """
+    global _last_gemini_call_time
+
+    elapsed = time.monotonic() - _last_gemini_call_time
+    if elapsed < MIN_GEMINI_INTERVAL_SEC:
+        remaining = MIN_GEMINI_INTERVAL_SEC - elapsed
+        print(f"[vlm] throttled — {remaining:.1f}s until next call")
+        return None
+
     path = Path(image_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Image not found: {path}")
@@ -271,6 +291,8 @@ def analyze_image(
             text = (getattr(response, "text", None) or "").strip()
             if not text:
                 raise ValueError("Empty response from model")
+
+            _last_gemini_call_time = time.monotonic()
             return text
 
         except FileNotFoundError:
@@ -278,6 +300,14 @@ def analyze_image(
         except RuntimeError:
             raise
         except Exception as exc:
+            err_str = str(exc)
+            # Quota / rate-limit — raise immediately, let server set cooldown
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                raise RuntimeError(f"Gemini quota exceeded: {exc}") from exc
+            # Auth / config / model-not-found — retrying will never help
+            if any(code in err_str for code in ("400", "403", "404")) or \
+               any(s in err_str for s in ("API Key", "INVALID_ARGUMENT", "PERMISSION_DENIED", "NOT_FOUND")):
+                raise RuntimeError(f"Gemini config error (non-retriable): {exc}") from exc
             if attempt < max_retries - 1:
                 time.sleep(_RETRY_DELAY_SEC)
             else:

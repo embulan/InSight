@@ -13,11 +13,13 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
     private var connectionState: ConnectionState = .disconnected
     private var pendingMessages: [URLSessionWebSocketTask.Message] = []
     private let decoder = JSONDecoder()
+    private var isDisconnecting = false
 
     var onEvent: ((IncomingBackendEvent) -> Void)?
 
     func connect(url: URL) {
         disconnect()
+        isDisconnecting = false
 
         let configuration = URLSessionConfiguration.default
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
@@ -34,6 +36,7 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
     }
 
     func disconnect() {
+        isDisconnecting = true
         pendingMessages.removeAll()
         connectionState = .disconnected
         socketTask?.cancel(with: .normalClosure, reason: nil)
@@ -120,7 +123,9 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
             switch result {
             case .failure(let error):
                 self?.connectionState = .disconnected
-                print("WebSocket receive error: \(error)")
+                if self?.isDisconnecting == false {
+                    print("WebSocket receive error: \(error)")
+                }
 
             case .success(let message):
                 switch message {
@@ -165,6 +170,7 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         didOpenWithProtocol `protocol`: String?
     ) {
         connectionState = .connected
+        isDisconnecting = false
         if Config.verboseLogging {
             print("WebSocket connected. Negotiated protocol:", `protocol` ?? "none")
         }
@@ -178,9 +184,12 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         reason: Data?
     ) {
         connectionState = .disconnected
+        let wasDisconnecting = isDisconnecting
+        isDisconnecting = false
         if Config.verboseLogging {
             let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
-            print("WebSocket closed:", closeCode.rawValue, "reason:", reasonText)
+            let closeKind = wasDisconnecting ? "client disconnect" : "remote close"
+            print("WebSocket closed:", closeCode.rawValue, closeKind, "reason:", reasonText)
         }
     }
 }
