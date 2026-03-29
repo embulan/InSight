@@ -1,2 +1,3 @@
 sim_check_testing/
 .env
+vlm_cache/
