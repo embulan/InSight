@@ -362,11 +362,11 @@ def run(image_path: str | Path, prompt: str = DEFAULT_PROMPT) -> str:
     return result
 
 
-def main() -> None:
-    import sys
-    image_arg = sys.argv[1] if len(sys.argv) > 1 else "test_image.jpg"
-    run(image_arg)
+# def main() -> None:
+#     import sys
+#     image_arg = sys.argv[1] if len(sys.argv) > 1 else "test_image.jpg"
+#     run(image_arg)
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
