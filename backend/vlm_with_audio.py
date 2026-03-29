@@ -43,22 +43,33 @@ load_dotenv()
 
 MODEL = "gemini-2.5-flash"
 
-DEFAULT_PROMPT = (
-    '''You are assisting a blind or low-vision user who is walking.
+DEFAULT_PROMPT = '''You are the navigation assistant for a blind or low-vision user who is walking.
 
-Identify only the most important navigation-relevant obstacles or hazards in this scene.
+Analyze the scene and report hazards using this EXACT format for each one:
+  [DIRECTION]: [OBJECT] — [ACTION]
 
-Prioritize:
-1. obstacles directly ahead in the walking path
-2. stairs, step-downs, curbs, ledges, drop-offs
-3. people, cars, bikes, or moving objects nearby
-4. doors, poles, chairs, tables, boxes, or objects that may be bumped into
-5. crosswalk state or traffic-related hazards if visible
+Rules:
+- DIRECTION must be one of: ahead, left, right, lower-left, lower-right, above
+- OBJECT is the hazard (e.g. "pole", "car", "stairs going down", "person")
+- ACTION is a short movement instruction: move left, move right, stop, slow down, step up, step down, use handrail
 
-Keep the response short and practical (2-3 sentences max).
-Include brief location for each hazard: ahead, left, right, lower left, lower right.
-Do not speculate. If nothing notable, reply: Clear.'''
-)
+Examples of good output:
+  ahead: car — stop immediately
+  left: pole — move right to avoid
+  right: sign — move left to avoid
+  ahead: stairs going down — slow down, use handrail
+  ahead: stairs going up — step up carefully
+  ahead: person — slow down
+  ahead: car and cyclist — stop, no clear path
+
+STAIR DIRECTION rules (critical for safety):
+- Steps rising away from camera (fronts visible, getting smaller) = "stairs going up"
+- Steps descending away from camera (tops visible, drop ahead) = "stairs going down"
+
+If multiple hazards exist, list each on its own line in this format.
+If the path is completely blocked with no safe direction, end with: "no clear path — stop"
+If nothing notable, reply exactly: Clear.
+Keep it short — no extra explanation.'''
 
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"  # "George" — works on all accounts
@@ -80,74 +91,167 @@ AMBIENT  = "ambient"
 PRIORITY_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, AMBIENT: 3}
 PRIORITY_ICON  = {CRITICAL: "🚨", HIGH: "⚠️ ", MEDIUM: "🔔", AMBIENT: "🗣 "}
 
-# ── Hazard keyword library ────────────────────────────────────────────────────
-# Each entry: (trigger_words, alert_text, priority)
-# ALL trigger_words must appear anywhere in the description to match.
+# ── Hazard classification ─────────────────────────────────────────────────────
+# Maps keywords found in the object part of a hazard line → priority level.
+# First match wins. Order matters — more specific first.
 
-HAZARD_KEYWORDS: list[tuple[list[str], str, str]] = [
-    # ── CRITICAL ──────────────────────────────────────────────────────────────
-    (["car"],                   "Car in your path!",           CRITICAL),
-    (["vehicle"],               "Vehicle ahead!",              CRITICAL),
-    (["truck"],                 "Truck ahead!",                CRITICAL),
-    (["bus"],                   "Bus ahead!",                  CRITICAL),
-    (["motorcycle"],            "Motorcycle ahead!",           CRITICAL),
-    (["step", "down"],          "Step down ahead!",            CRITICAL),
-    (["step", "up"],            "Step up ahead!",              CRITICAL),
-    (["curb"],                  "Curb ahead!",                 CRITICAL),
-    (["stair"],                 "Stairs ahead!",               CRITICAL),
-    (["wet", "floor"],          "Wet floor!",                  CRITICAL),
-    (["low", "ceiling"],        "Low ceiling ahead!",          CRITICAL),
-    (["drop"],                  "Drop-off ahead!",             CRITICAL),
-    (["traffic"],               "Traffic — stop!",             CRITICAL),
-    # ── HIGH ──────────────────────────────────────────────────────────────────
-    (["bicycle"],               "Bicycle nearby.",             HIGH),
-    (["bike"],                  "Bike nearby.",                HIGH),
-    (["cyclist"],               "Cyclist nearby.",             HIGH),
-    (["pedestrian"],            "Pedestrian ahead.",           HIGH),
-    (["person"],                "Person ahead.",               HIGH),
-    (["people"],                "People ahead.",               HIGH),
-    (["scooter"],               "Scooter nearby.",             HIGH),
-    (["dog"],                   "Dog nearby.",                 HIGH),
-    (["runner"],                "Runner nearby.",              HIGH),
-    (["crowd"],                 "Crowd ahead.",                HIGH),
-    # ── MEDIUM ────────────────────────────────────────────────────────────────
-    (["door"],                  "Door ahead.",                 MEDIUM),
-    (["pole"],                  "Pole ahead.",                 MEDIUM),
-    (["bollard"],               "Bollard ahead.",              MEDIUM),
-    (["shopping", "cart"],      "Shopping cart ahead.",        MEDIUM),
-    (["construction"],          "Construction nearby.",        MEDIUM),
-    (["chair"],                 "Chair in path.",              MEDIUM),
-    (["table"],                 "Table in path.",              MEDIUM),
-    (["bench"],                 "Bench ahead.",                MEDIUM),
-    (["sign"],                  "Sign in path.",               MEDIUM),
-    (["rock"],                  "Rock in path.",               MEDIUM),
-    (["barrier"],               "Barrier ahead.",              MEDIUM),
-    (["cone"],                  "Cone in path.",               MEDIUM),
+OBJECT_PRIORITY: list[tuple[list[str], str]] = [
+    # CRITICAL
+    (["car"],          CRITICAL),
+    (["vehicle"],      CRITICAL),
+    (["truck"],        CRITICAL),
+    (["bus"],          CRITICAL),
+    (["motorcycle"],   CRITICAL),
+    (["traffic"],      CRITICAL),
+    (["stairs", "down"], CRITICAL),
+    (["steps", "down"],  CRITICAL),
+    (["descend"],      CRITICAL),
+    (["stair"],        CRITICAL),
+    (["step", "down"], CRITICAL),
+    (["curb"],         CRITICAL),
+    (["drop"],         CRITICAL),
+    (["wet", "floor"], CRITICAL),
+    (["low", "ceiling"], CRITICAL),
+    # HIGH
+    (["stairs", "up"], HIGH),
+    (["steps", "up"],  HIGH),
+    (["step", "up"],   HIGH),
+    (["steps"],        HIGH),
+    (["bicycle"],      HIGH),
+    (["bike"],         HIGH),
+    (["cyclist"],      HIGH),
+    (["person"],       HIGH),
+    (["people"],       HIGH),
+    (["pedestrian"],   HIGH),
+    (["scooter"],      HIGH),
+    (["dog"],          HIGH),
+    (["runner"],       HIGH),
+    (["crowd"],        HIGH),
+    # MEDIUM
+    (["door"],         MEDIUM),
+    (["pole"],         MEDIUM),
+    (["bollard"],      MEDIUM),
+    (["sign"],         MEDIUM),
+    (["chair"],        MEDIUM),
+    (["table"],        MEDIUM),
+    (["bench"],        MEDIUM),
+    (["barrier"],      MEDIUM),
+    (["cone"],         MEDIUM),
+    (["rock"],         MEDIUM),
+    (["construction"], MEDIUM),
+    (["shopping", "cart"], MEDIUM),
 ]
 
+# ── Direction → spoken phrase ─────────────────────────────────────────────────
 
-# ── Hazard matching ───────────────────────────────────────────────────────────
+DIRECTION_PHRASE: dict[str, str] = {
+    "ahead":       "directly ahead",
+    "left":        "on your left",
+    "right":       "on your right",
+    "lower-left":  "to your lower left",
+    "lower-right": "to your lower right",
+    "above":       "above you",
+}
 
-def find_hazards(description: str) -> list[tuple[str, str, str]]:
+# ── Action → spoken phrase ────────────────────────────────────────────────────
+
+def spoken_action(action: str) -> str:
+    """Convert a short action code into a natural spoken instruction."""
+    a = action.lower().strip()
+    if "no clear path" in a or "stop" in a:
+        return "Stop — no clear path."
+    if "move right" in a:
+        return "Move right to avoid."
+    if "move left" in a:
+        return "Move left to avoid."
+    if "slow down" in a and "handrail" in a:
+        return "Slow down and use the handrail."
+    if "slow down" in a:
+        return "Slow down."
+    if "step up" in a:
+        return "Step up carefully."
+    if "step down" in a:
+        return "Step down carefully."
+    if "use handrail" in a:
+        return "Use the handrail."
+    return action.strip().rstrip(".")  + "."
+
+
+# ── Parse VLM structured output ───────────────────────────────────────────────
+
+def classify_priority(object_text: str) -> str:
+    """Return priority level based on keywords in the object description."""
+    t = object_text.lower()
+    for keywords, priority in OBJECT_PRIORITY:
+        if all(kw in t for kw in keywords):
+            return priority
+    return MEDIUM  # default unknown objects to medium
+
+
+def parse_hazard_lines(description: str) -> list[dict]:
     """
-    Returns ALL matched hazards sorted critical → high → medium.
-    Each entry: (matched keywords string, alert text, priority)
-    Deduplicates by alert text so the same warning isn't repeated.
+    Parse structured VLM output into hazard dicts.
+    Each line expected: "direction: object — action"
+    Returns list of {direction, object, action, priority, spoken}
     """
-    text = description.lower()
-    found = []
-    seen_alerts: set[str] = set()
+    hazards = []
+    seen: set[str] = set()
 
-    for keywords, alert, priority in HAZARD_KEYWORDS:
-        if alert in seen_alerts:
+    for line in description.strip().splitlines():
+        line = line.strip().lstrip("-•* ").strip()
+        if not line or line.lower() == "clear.":
             continue
-        if all(kw in text for kw in keywords):
-            found.append((", ".join(keywords), alert, priority))
-            seen_alerts.add(alert)
 
-    # Sort: critical first, then high, then medium
-    found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
-    return found
+        # Parse "direction: object — action"
+        if ":" not in line:
+            continue
+
+        colon_idx = line.index(":")
+        direction_raw = line[:colon_idx].strip().lower()
+        rest = line[colon_idx + 1:].strip()
+
+        # Split on — or - for action
+        if "—" in rest:
+            obj_part, action_part = rest.split("—", 1)
+        elif " - " in rest:
+            obj_part, action_part = rest.split(" - ", 1)
+        else:
+            obj_part   = rest
+            action_part = "be careful"
+
+        obj_part    = obj_part.strip()
+        action_part = action_part.strip()
+
+        # Normalise direction
+        direction = direction_raw
+        for key in DIRECTION_PHRASE:
+            if key in direction_raw:
+                direction = key
+                break
+
+        priority = classify_priority(obj_part)
+        dir_phrase = DIRECTION_PHRASE.get(direction, f"to your {direction}")
+        action_spoken = spoken_action(action_part)
+
+        # Build spoken alert
+        spoken = f"Warning: {obj_part} {dir_phrase}. {action_spoken}"
+
+        dedup_key = f"{direction}:{obj_part.lower()}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        hazards.append({
+            "direction": direction,
+            "object":    obj_part,
+            "action":    action_part,
+            "priority":  priority,
+            "spoken":    spoken,
+        })
+
+    # Sort critical → high → medium
+    hazards.sort(key=lambda h: PRIORITY_ORDER.get(h["priority"], 9))
+    return hazards
 
 
 # ── Synthesised sound effects (no files needed) ───────────────────────────────
@@ -328,17 +432,18 @@ def run_frame(image_path: str | Path, tts: TTSEngine, frame_num: int = 1) -> str
     print(f"result           : {result}")
     print("─" * 55)
 
-    hazards = find_hazards(result)
+    is_clear = result.strip().lower().startswith("clear")
+    hazards  = [] if is_clear else parse_hazard_lines(result)
 
     t_audio_start = time.perf_counter()
 
     if hazards:
         print(f"hazards detected : {len(hazards)}")
-        for phrase, alert, priority in hazards:
-            icon = PRIORITY_ICON.get(priority, "  ")
-            print(f"  {icon} [{priority.upper():<8}] {alert}  (matched: '{phrase}')")
-            tts.play_priority_tone(priority)
-            tts.speak(alert)
+        for h in hazards:
+            icon = PRIORITY_ICON.get(h["priority"], "  ")
+            print(f"  {icon} [{h['priority'].upper():<8}] {h['spoken']}")
+            tts.play_priority_tone(h["priority"])
+            tts.speak(h["spoken"])
     else:
         print("hazards detected : none — ambient")
         now = time.time()
