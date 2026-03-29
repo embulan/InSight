@@ -70,6 +70,15 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         if Config.verboseLogging { print("WebSocket: submit sent") }
     }
 
+    func sendLocation(lat: Double, lon: Double) {
+        sendJSONObject([
+            "type": "location",
+            "timestampMs": now(),
+            "lat": lat,
+            "lon": lon,
+        ])
+    }
+
     // MARK: - Helpers
 
     private func now() -> Int64 {

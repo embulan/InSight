@@ -7,9 +7,12 @@ final class AppCoordinator: ObservableObject {
 
     @Published var state: AssistState = .idle
     @Published var latestCaption: String = ""
+    /// Current walking-nav instruction from the server (`nav_step`); empty when inactive.
+    @Published var navStepLine: String = ""
 
     private let phoneSession: PhoneSessionManager? = Config.watchConnectivityEnabled ? .shared : nil
     private let cameraManager = CameraManager()
+    private let locationSender = LocationSender()
     var cameraSession: AVCaptureSession { cameraManager.session }
     private let frameSampler = FrameSampler(secondsBetweenFrames: Config.frameInterval)
     private let jpegEncoder = JPEGEncoder()
@@ -41,6 +44,8 @@ final class AppCoordinator: ObservableObject {
         socketClient.onEvent = { [weak self] event in
             self?.handleBackendEvent(event)
         }
+
+        locationSender.attach(client: socketClient)
     }
 
     // MARK: - Public controls (called from UI and watch)
@@ -103,15 +108,18 @@ final class AppCoordinator: ObservableObject {
         }
 
         socketClient.connect(url: Config.backendWebSocketURL)
+        locationSender.start()
     }
 
     private func stopAssist() {
         audioManager.stop()
         cameraManager.stop()
+        locationSender.stop()
         socketClient.disconnect()
         resetBufferedAudio()
         state = .idle
         latestCaption = ""
+        navStepLine = ""
         sendWatchStatus(mode: "idle")
     }
 
@@ -151,6 +159,12 @@ final class AppCoordinator: ObservableObject {
             guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
             audioPlayer.stop()   // cut off any previous clip before starting the new one
             audioPlayer.play(mp3Data: mp3Data)
+
+        case "nav_step":
+            let line = event.message ?? ""
+            DispatchQueue.main.async {
+                self.navStepLine = line
+            }
 
         case "status":
             if Config.verboseLogging { print("Server status:", event.message ?? "") }

@@ -6,6 +6,8 @@
 	<string>This app uses the camera for live assist features.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app uses the microphone to capture voice prompts during live assist.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Location is used for walking navigation while live assist is on.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

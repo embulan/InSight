@@ -49,6 +49,31 @@ struct PhoneDebugView: View {
                     .transition(.opacity.combined(with: .scale))
             }
 
+            // Walking navigation — current step (from server `nav_step`)
+            if isActive && !coordinator.navStepLine.isEmpty {
+                VStack {
+                    HStack(spacing: 10) {
+                        Image(systemName: "location.north.line.fill")
+                            .font(.body.weight(.semibold))
+                            .foregroundStyle(.cyan.opacity(0.95))
+                        Text(coordinator.navStepLine)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.leading)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.black.opacity(0.65))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .padding(.horizontal, 20)
+                    .padding(.top, coordinator.latestCaption.isEmpty ? 120 : 56)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+
             // Caption overlay — appears when backend sends a description
             if isActive && !coordinator.latestCaption.isEmpty {
                 VStack {
@@ -124,6 +149,7 @@ struct PhoneDebugView: View {
         )
         .animation(.easeInOut(duration: 0.3), value: coordinator.state)
         .animation(.easeInOut(duration: 0.4), value: coordinator.latestCaption)
+        .animation(.easeInOut(duration: 0.3), value: coordinator.navStepLine)
         .onChange(of: isStreaming) { streaming in
             guard streaming else { return }
             withAnimation { showGestureHint = true }
