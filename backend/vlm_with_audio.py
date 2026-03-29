@@ -264,7 +264,6 @@ def analyze_image(
                 model=model,
                 contents=[prompt, image],
                 config=types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                     media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
                 )
             )
