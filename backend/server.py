@@ -192,6 +192,8 @@ async def websocket_endpoint(websocket: WebSocket):
     audio_sample_rate = 44100
     # monotonic timestamp after which Gemini calls are allowed again (0 = always allowed)
     gemini_cooldown_until: float = 0.0
+    # doubles on each 429; resets on success — caps at 10 minutes
+    _gemini_cooldown_secs: float = GEMINI_COOLDOWN_SECS
 
     # Prevents concurrent heavy AI calls for the same client
     vision_lock = asyncio.Lock()
@@ -291,14 +293,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send({"type": "error", "message": "No frames received yet.", "data": None})
                     return
 
+                if not caption:
+                    print("[submit] VLM throttled or returned empty")
+                    await send({"type": "error", "message": "Too soon — try again in a moment.", "data": None})
+                    return
+
                 await send_caption_and_audio(caption)
 
             except Exception as exc:
                 if _is_quota_error(exc):
-                    gemini_cooldown_until = time.monotonic() + GEMINI_COOLDOWN_SECS
-                    remaining = GEMINI_COOLDOWN_SECS
+                    nonlocal _gemini_cooldown_secs
+                    gemini_cooldown_until = time.monotonic() + _gemini_cooldown_secs
+                    remaining = _gemini_cooldown_secs
+                    _gemini_cooldown_secs = min(_gemini_cooldown_secs * 2, 600)
                     print(f"[submit ai] quota/rate-limit — cooldown {remaining:.0f}s")
-                    await send({"type": "status", "message": f"Rate limited. Pausing {int(remaining)}s.", "data": None})
+                    await send({"type": "error", "message": f"Rate limited. Try again in {int(remaining)}s.", "data": None})
                 else:
                     print(f"[submit ai] error: {exc}")
                     await send({"type": "error", "message": str(exc)[:200], "data": None})

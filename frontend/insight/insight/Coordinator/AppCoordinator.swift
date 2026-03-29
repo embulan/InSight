@@ -77,6 +77,15 @@ final class AppCoordinator: ObservableObject {
 
         state = .liveAssist(phase: .processing)
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.processing.rawValue)
+
+        // Safety net: if no caption/error arrives within 30 s, recover automatically
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            if case .liveAssist(phase: .processing) = self.state {
+                self.state = .liveAssist(phase: .observing)
+                self.sendWatchStatus(mode: "liveAssist", phase: AssistPhase.observing.rawValue)
+            }
+        }
     }
 
     // MARK: - Private
@@ -140,11 +149,15 @@ final class AppCoordinator: ObservableObject {
             guard let text = event.message, !text.isEmpty else { return }
             DispatchQueue.main.async {
                 self.latestCaption = text
-                // Return from processing → observing once we have the caption
+                // Return from processing → observing and push caption to watch
                 if case .liveAssist(phase: .processing) = self.state {
                     self.state = .liveAssist(phase: .observing)
-                    self.sendWatchStatus(mode: "liveAssist", phase: AssistPhase.observing.rawValue)
                 }
+                self.sendWatchStatus(
+                    mode: "liveAssist",
+                    phase: AssistPhase.observing.rawValue,
+                    caption: text
+                )
             }
 
         case "audio":
@@ -181,6 +194,7 @@ final class AppCoordinator: ObservableObject {
     private func sendWatchStatus(
         mode: String,
         phase: String? = nil,
+        caption: String? = nil,
         destination: String? = nil,
         etaText: String? = nil
     ) {
@@ -188,6 +202,7 @@ final class AppCoordinator: ObservableObject {
         phoneSession?.sendWatchStatus(
             mode: mode,
             phase: phase,
+            caption: caption,
             destination: destination,
             etaText: etaText
         )

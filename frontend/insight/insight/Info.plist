@@ -22,5 +22,7 @@
 		<key>UISceneConfigurations</key>
 		<dict/>
 	</dict>
+	<key>default configuration</key>
+	<string></string>
 </dict>
 </plist>
