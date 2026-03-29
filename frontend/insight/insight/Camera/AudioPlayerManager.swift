@@ -13,6 +13,15 @@ final class AudioPlayerManager: NSObject {
         }
     }
 
+    /// Stop playback immediately.  Safe to call from any thread.
+    func stop() {
+        DispatchQueue.main.async { [weak self] in
+            self?.player?.stop()
+            self?.player = nil
+            if Config.verboseLogging { print("AudioPlayer: playback stopped") }
+        }
+    }
+
     private func _play(_ data: Data) {
         do {
             let session = AVAudioSession.sharedInstance()

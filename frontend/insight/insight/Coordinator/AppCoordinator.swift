@@ -51,6 +51,10 @@ final class AppCoordinator: ObservableObject {
     func enterQueryMode() {
         guard case .liveAssist = state else { return }
         resetBufferedAudio()
+
+        // Stop any TTS that is currently playing so it doesn't bleed into the recording
+        audioPlayer.stop()
+
         state = .liveAssist(phase: .listening)
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.listening.rawValue)
 
@@ -113,6 +117,9 @@ final class AppCoordinator: ObservableObject {
 
     private func handleSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard isStreamingState else { return }
+        // Do not send frames while recording a voice query — the backend
+        // should stay quiet and save Gemini quota until submit arrives.
+        if case .liveAssist(phase: .listening) = state { return }
         guard frameSampler.shouldSendFrame() else { return }
 
         frameProcessingQueue.async { [weak self] in
@@ -142,6 +149,7 @@ final class AppCoordinator: ObservableObject {
 
         case "audio":
             guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
+            audioPlayer.stop()   // cut off any previous clip before starting the new one
             audioPlayer.play(mp3Data: mp3Data)
 
         case "status":
