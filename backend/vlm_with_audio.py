@@ -61,11 +61,6 @@ _DEFAULT_TIMEOUT_MS = 120_000
 _MAX_RETRIES        = 3
 _RETRY_DELAY_SEC    = 1.0
 
-# Minimum seconds between Gemini calls. Prevents quota drain when frames
-# arrive faster than Gemini can respond.
-MIN_GEMINI_INTERVAL_SEC: float = 8.0
-_last_gemini_call_time:  float = 0.0
-
 AMBIENT_INTERVAL_SEC = 5.0   # how often ambient descriptions are spoken
 _last_ambient_time   = 0.0
 
@@ -83,38 +78,77 @@ PRIORITY_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, AMBIENT: 3}
 # ── Hazard library ────────────────────────────────────────────────────────────
 # phrase → (short spoken alert, priority)
 
-HAZARD_LIBRARY: dict[str, tuple[str, str]] = {
-    # CRITICAL — alarm sound + stern alert
-    "step down":        ("Step down ahead!",          CRITICAL),
-    "step up":          ("Step up ahead!",            CRITICAL),
-    "curb":             ("Curb ahead!",               CRITICAL),
-    "stairs":           ("Stairs ahead!",             CRITICAL),
-    "obstacle ahead":   ("Obstacle ahead!",           CRITICAL),
-    "wet floor":        ("Wet floor!",                CRITICAL),
-    "car ahead":        ("Car ahead!",                CRITICAL),
-    "car approaching":  ("Stop! - Car approaching",   CRITICAL),
-    "crossing traffic": ("Stop! - Traffic crossing",  CRITICAL),
-    "low ceiling":      ("Low ceiling ahead!",        CRITICAL),
-    "drop":             ("Drop-off ahead!",           CRITICAL),
+# HAZARD_LIBRARY: dict[str, tuple[str, str]] = {
+#     # CRITICAL — alarm sound + stern alert
+#     "step down":        ("Step down ahead!",          CRITICAL),
+#     "step up":          ("Step up ahead!",            CRITICAL),
+#     "curb":             ("Curb ahead!",               CRITICAL),
+#     "stairs":           ("Stairs ahead!",             CRITICAL),
+#     "obstacle ahead":   ("Obstacle ahead!",           CRITICAL),
+#     "wet floor":        ("Wet floor!",                CRITICAL),
+#     "car ahead":        ("Car ahead!",                CRITICAL),
+#     "car approaching":  ("Stop! - Car approaching",   CRITICAL),
+#     "crossing traffic": ("Stop! - Traffic crossing",  CRITICAL),
+#     "low ceiling":      ("Low ceiling ahead!",        CRITICAL),
+#     "drop":             ("Drop-off ahead!",           CRITICAL),
 
-    # HIGH — soft alert tone + short alert
-    "bicycle":          ("Bicycle nearby.",           HIGH),
-    "cyclist":          ("Cyclist nearby.",           HIGH),
-    "person ahead":     ("Person ahead.",             HIGH),
-    "person approaching": ("Person approaching.",     HIGH),
-    "scooter":          ("Scooter nearby.",           HIGH),
-    "dog":              ("Dog nearby.",               HIGH),
+#     # HIGH — soft alert tone + short alert
+#     "bicycle":          ("Bicycle nearby.",           HIGH),
+#     "cyclist":          ("Cyclist nearby.",           HIGH),
+#     "person ahead":     ("Person ahead.",             HIGH),
+#     "person approaching": ("Person approaching.",     HIGH),
+#     "scooter":          ("Scooter nearby.",           HIGH),
+#     "dog":              ("Dog nearby.",               HIGH),
 
-    # MEDIUM — soft chime + short alert
-    "door":             ("Door ahead.",               MEDIUM),
-    "pole":             ("Pole ahead.",               MEDIUM),
-    "bollard":          ("Bollard ahead.",            MEDIUM),
-    "chair":            ("Chair in path.",            MEDIUM),
-    "table":            ("Table in path.",            MEDIUM),
-    "shopping cart":    ("Shopping cart ahead.",      MEDIUM),
-    "construction":     ("Construction nearby.",      MEDIUM),
-    "sign":             ("Sign in path.",             MEDIUM),
-}
+#     # MEDIUM — soft chime + short alert
+#     "door":             ("Door ahead.",               MEDIUM),
+#     "pole":             ("Pole ahead.",               MEDIUM),
+#     "bollard":          ("Bollard ahead.",            MEDIUM),
+#     "chair":            ("Chair in path.",            MEDIUM),
+#     "table":            ("Table in path.",            MEDIUM),
+#     "shopping cart":    ("Shopping cart ahead.",      MEDIUM),
+#     "construction":     ("Construction nearby.",      MEDIUM),
+#     "sign":             ("Sign in path.",             MEDIUM),
+# }
+HAZARD_KEYWORDS: list[tuple[list[str], str, str]] = [
+    # (trigger words — ALL must appear, alert, priority)
+    (["car", "ahead"],       "Car ahead!",              CRITICAL),
+    (["car", "approaching"], "Car approaching — stop!", CRITICAL),
+    (["car", "towards"],     "Car approaching — stop!", CRITICAL),
+    (["vehicle", "ahead"],   "Vehicle ahead!",          CRITICAL),
+    (["vehicle", "approaching"], "Vehicle approaching!", CRITICAL),
+    (["truck", "ahead"],     "Truck ahead!",            CRITICAL),
+    (["motorcycle"],         "Motorcycle ahead!",       CRITICAL),
+    (["step", "down"],       "Step down ahead!",        CRITICAL),
+    (["step", "up"],         "Step up ahead!",          CRITICAL),
+    (["curb"],               "Curb ahead!",             CRITICAL),
+    (["stair"],              "Stairs ahead!",           CRITICAL),
+    (["wet", "floor"],       "Wet floor!",              CRITICAL),
+    (["low", "ceiling"],     "Low ceiling ahead!",      CRITICAL),
+    (["drop"],               "Drop-off ahead!",         CRITICAL),
+    (["bicycle"],            "Bicycle nearby.",         HIGH),
+    (["cyclist"],            "Cyclist nearby.",         HIGH),
+    (["person", "ahead"],    "Person ahead.",           HIGH),
+    (["person", "approaching"], "Person approaching.",  HIGH),
+    (["scooter"],            "Scooter nearby.",         HIGH),
+    (["dog"],                "Dog nearby.",             HIGH),
+    (["door"],               "Door ahead.",             MEDIUM),
+    (["pole"],               "Pole ahead.",             MEDIUM),
+    (["bollard"],            "Bollard ahead.",          MEDIUM),
+    (["shopping", "cart"],   "Shopping cart ahead.",    MEDIUM),
+    (["construction"],       "Construction nearby.",    MEDIUM),
+]
+
+def find_hazards(description: str) -> list[tuple[str, str, str]]:
+    text = description.lower()
+    found = []
+    seen_alerts = set()
+    for keywords, alert, priority in HAZARD_KEYWORDS:
+        if all(kw in text for kw in keywords) and alert not in seen_alerts:
+            found.append((keywords[0], alert, priority))
+            seen_alerts.add(alert)
+    found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
+    return found
 
 
 # ── Synthesised sound effects (no audio files needed) ────────────────────────
@@ -252,22 +286,7 @@ def analyze_image(
     *,
     model: str = MODEL,
     max_retries: int = _MAX_RETRIES,
-) -> str | None:
-    """
-    Call Gemini vision on *image_path* and return the model's text.
-
-    Returns None (without raising) when the inter-call throttle is active.
-    Raises RuntimeError immediately for quota (429) and auth (400) errors
-    since retrying those is always wasteful.
-    """
-    global _last_gemini_call_time
-
-    elapsed = time.monotonic() - _last_gemini_call_time
-    if elapsed < MIN_GEMINI_INTERVAL_SEC:
-        remaining = MIN_GEMINI_INTERVAL_SEC - elapsed
-        print(f"[vlm] throttled — {remaining:.1f}s until next call")
-        return None
-
+) -> str:
     path = Path(image_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Image not found: {path}")
@@ -291,8 +310,6 @@ def analyze_image(
             text = (getattr(response, "text", None) or "").strip()
             if not text:
                 raise ValueError("Empty response from model")
-
-            _last_gemini_call_time = time.monotonic()
             return text
 
         except FileNotFoundError:
@@ -300,14 +317,6 @@ def analyze_image(
         except RuntimeError:
             raise
         except Exception as exc:
-            err_str = str(exc)
-            # Quota / rate-limit — raise immediately, let server set cooldown
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
-                raise RuntimeError(f"Gemini quota exceeded: {exc}") from exc
-            # Auth / config / model-not-found — retrying will never help
-            if any(code in err_str for code in ("400", "403", "404")) or \
-               any(s in err_str for s in ("API Key", "INVALID_ARGUMENT", "PERMISSION_DENIED", "NOT_FOUND")):
-                raise RuntimeError(f"Gemini config error (non-retriable): {exc}") from exc
             if attempt < max_retries - 1:
                 time.sleep(_RETRY_DELAY_SEC)
             else:
@@ -316,20 +325,20 @@ def analyze_image(
 
 # ── Hazard matching ───────────────────────────────────────────────────────────
 
-def find_hazards(description: str) -> list[tuple[str, str, str]]:
-    """
-    Returns list of (phrase, alert_text, priority) found in description,
-    sorted critical → high → medium.
-    """
-    text = description.lower()
-    found = []
-    seen_alerts = set()
-    for phrase, (alert, priority) in HAZARD_LIBRARY.items():
-        if phrase in text and alert not in seen_alerts:
-            found.append((phrase, alert, priority))
-            seen_alerts.add(alert)
-    found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
-    return found
+# def find_hazards(description: str) -> list[tuple[str, str, str]]:
+#     """
+#     Returns list of (phrase, alert_text, priority) found in description,
+#     sorted critical → high → medium.
+#     """
+#     text = description.lower()
+#     found = []
+#     seen_alerts = set()
+#     for phrase, (alert, priority) in HAZARD_LIBRARY.items():
+#         if phrase in text and alert not in seen_alerts:
+#             found.append((phrase, alert, priority))
+#             seen_alerts.add(alert)
+#     found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
+#     return found
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -392,11 +401,11 @@ def run(image_path: str | Path, prompt: str = DEFAULT_PROMPT) -> str:
     return result
 
 
-# def main() -> None:
-#     import sys
-#     image_arg = sys.argv[1] if len(sys.argv) > 1 else "test_image.jpg"
-#     run(image_arg)
+def main() -> None:
+    import sys
+    image_arg = sys.argv[1] if len(sys.argv) > 1 else "test-image2.jpg"
+    run(image_arg)
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
