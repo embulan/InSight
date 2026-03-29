@@ -1,9 +1,9 @@
 import AVFoundation
-import UIKit
 import CoreImage
 
 final class JPEGEncoder {
     private let context = CIContext()
+    private let colorSpace = CGColorSpaceCreateDeviceRGB()
 
     func encode(
         sampleBuffer: CMSampleBuffer,
@@ -14,12 +14,10 @@ final class JPEGEncoder {
         }
 
         let ciImage = CIImage(cvPixelBuffer: imageBuffer)
-
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-            return nil
-        }
-
-        let image = UIImage(cgImage: cgImage)
-        return image.jpegData(compressionQuality: compressionQuality)
+        return context.jpegRepresentation(
+            of: ciImage,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: compressionQuality]
+        )
     }
 }

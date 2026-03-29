@@ -3,7 +3,8 @@ import AVFoundation
 final class CameraManager: NSObject {
     let session = AVCaptureSession()
     private let videoOutput = AVCaptureVideoDataOutput()
-    private let queue = DispatchQueue(label: "camera.capture.queue")
+    private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private let outputQueue = DispatchQueue(label: "camera.output.queue", qos: .userInitiated)
     private var isConfigured = false
 
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
@@ -14,12 +15,12 @@ final class CameraManager: NSObject {
             try configure()
         }
         guard !session.isRunning else { return }
-        queue.async { self.session.startRunning() }
+        sessionQueue.async { self.session.startRunning() }
     }
 
     func stop() {
         guard session.isRunning else { return }
-        queue.async { self.session.stopRunning() }
+        sessionQueue.async { self.session.stopRunning() }
     }
 
     private func configure() throws {
@@ -42,7 +43,7 @@ final class CameraManager: NSObject {
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
-        videoOutput.setSampleBufferDelegate(self, queue: queue)
+        videoOutput.setSampleBufferDelegate(self, queue: outputQueue)
 
         guard session.canAddOutput(videoOutput) else {
             session.commitConfiguration()

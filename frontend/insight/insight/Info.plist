@@ -6,6 +6,11 @@
 	<string>This app uses the camera for live assist features.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>This app uses the microphone to capture voice prompts during live assist.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>CFBundleDisplayName</key>
 	<string>Insight</string>
 	<key>CFBundleIdentifier</key>
