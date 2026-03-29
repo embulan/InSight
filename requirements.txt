@@ -9,6 +9,9 @@ tenacity>=8.1.0,<9
 anyio>=3.7.1
 FuzzyTM>=0.4.0
 
+# HTTP (navigation / Maps)
+requests>=2.31.0
+
 # WebSocket server
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0

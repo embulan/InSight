@@ -21,6 +21,7 @@ Incoming messages from iPhone
   {"type": "frame",  "timestampMs": <int>, "jpegBase64":  "<b64>"}
   {"type": "audio",  "timestampMs": <int>, "sampleRate":  <int>, "pcmBase64": "<b64>"}
   {"type": "submit", "timestampMs": <int>}
+  {"type": "location", "timestampMs": <int>, "lat": <float>, "lon": <float>}
 
 Outgoing messages to iPhone
 ----------------------------
@@ -28,6 +29,14 @@ Outgoing messages to iPhone
   {"type": "audio",   "message": null,     "data": "<base64 mp3>"}
   {"type": "status",  "message": "<text>", "data": null}
   {"type": "error",   "message": "<text>", "data": null}
+  {"type": "nav_step", "message": "<current nav instruction>", "data": null}
+
+Navigation (voice + GPS)
+------------------------
+  Requires GOOGLE_MAPS_API_KEY. After submit with speech \"navigate to …\", the server
+  geocodes, fetches a walking route from the last ``location`` fix, and TTSes the
+  acknowledgment plus the first step. Ongoing ``location`` messages advance steps and
+  trigger proximity cues. Say \"what should I do\" (etc.) for a spoken current step.
 
 Run from repo root
 ------------------
@@ -52,6 +61,9 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from PIL import Image
 
+from backend.navigation.command_parser import parse_command
+from backend.navigation.gemini_transcribe import transcribe_wav
+from backend.navigation.manager import NavigationManager
 from backend.pipeline import run_pipeline
 from backend.update_image_cache import FrameCache
 from backend.vlm_with_audio import analyze_image, _get_client, MODEL
@@ -194,9 +206,17 @@ async def websocket_endpoint(websocket: WebSocket):
     gemini_cooldown_until: float = 0.0
     # doubles on each 429; resets on success — caps at 10 minutes
     _gemini_cooldown_secs: float = GEMINI_COOLDOWN_SECS
+    # set to True when a submit arrives so respond_frame bails immediately
+    submit_pending: bool = False
 
     # Prevents concurrent heavy AI calls for the same client
     vision_lock = asyncio.Lock()
+    nav_lock = asyncio.Lock()
+
+    # Walking navigation (Google Maps + proximity cues)
+    nav = NavigationManager()
+    last_gps: Optional[tuple[float, float]] = None
+    last_nav_ui_sent: str = "\n"  # force first push
 
     # -------------------------------------------------------------------------
     async def send(obj: dict) -> None:
@@ -218,13 +238,44 @@ async def websocket_endpoint(websocket: WebSocket):
             "data": base64.b64encode(mp3_bytes).decode(),
         })
 
+    async def push_nav_ui_if_changed() -> None:
+        """Minimal nav overlay updates — only when the displayed line changes."""
+        nonlocal last_nav_ui_sent
+        line = nav.nav_display_line()
+        if line == last_nav_ui_sent:
+            return
+        last_nav_ui_sent = line
+        await send({"type": "nav_step", "message": line, "data": None})
+
+    async def handle_gps_tick(lat: float, lon: float) -> None:
+        """Update route progress and speak proximity cues (does not take vision_lock)."""
+        nonlocal last_gps
+        last_gps = (lat, lon)
+        cues: list[str] = []
+        async with nav_lock:
+            nav.update_location(lat, lon)
+            for _ in range(4):
+                t = nav.check_instruction_trigger()
+                if not t:
+                    break
+                text = (t.get("text") or "").strip()
+                if text:
+                    cues.append(text)
+            await push_nav_ui_if_changed()
+        for line in cues:
+            await send_caption_and_audio(line)
+
     async def respond_frame(jpeg_bytes: bytes) -> None:
         """
         Run the full pipeline (sim_check → cache → VLM) for a frame.
-        Only fires when vision_lock is free and cooldown has expired.
+        Bails immediately if a submit arrives while processing.
         """
         nonlocal gemini_cooldown_until
         async with vision_lock:
+            # Submit arrived while we were waiting for the lock — hand off immediately
+            if submit_pending:
+                print("[frame] submit pending — skipping frame pipeline")
+                return
             try:
                 await send({"type": "status", "message": "Analyzing...", "data": None})
 
@@ -232,6 +283,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 result = await asyncio.get_running_loop().run_in_executor(
                     None, lambda: run_pipeline(jpeg_bytes, cache=frame_cache)
                 )
+
+                # Submit arrived while Gemini was running — drop this result
+                if submit_pending:
+                    print("[frame] submit arrived mid-pipeline — discarding frame result")
+                    return
 
                 sr = result["scene_result"]
                 if sr:
@@ -264,41 +320,106 @@ async def websocket_endpoint(websocket: WebSocket):
 
     async def respond_submit(wav_bytes: Optional[bytes]) -> None:
         """
-        Force a VLM call on the latest cached frame, including voice audio
-        if the user spoke a query.
+        Voice: transcribe first, then navigation commands, else vision+audio hazard Q&A.
+        No audio: vision-only on latest cached frame.
         """
-        nonlocal gemini_cooldown_until
+        nonlocal gemini_cooldown_until, last_nav_ui_sent, submit_pending
         async with vision_lock:
+            submit_pending = False  # we now own the lock — clear the flag
             try:
                 await send({"type": "status", "message": "Processing...", "data": None})
 
                 latest_path = frame_cache.get_latest()
 
                 if wav_bytes and len(wav_bytes) > 100:
-                    # Voice query: Gemini sees image + hears audio
+                    print("[submit] transcribe audio (Gemini)")
+                    transcript = await asyncio.get_running_loop().run_in_executor(
+                        None, transcribe_wav, wav_bytes
+                    )
+                    transcript = (transcript or "").strip().strip('"').strip("'")
+                    print(f"[submit] transcript → {transcript[:120]!r}")
+
+                    parsed = parse_command(transcript)
+                    intent = parsed.get("intent", "UNKNOWN")
+
+                    if intent == "QUERY_NEXT_DIRECTION":
+                        async with nav_lock:
+                            answer = nav.get_current_instruction()
+                            last_nav_ui_sent = "\n"
+                            await push_nav_ui_if_changed()
+                        await send_caption_and_audio(answer)
+                        return
+
+                    if intent == "NAVIGATE":
+                        dest = (parsed.get("destination") or "").strip()
+                        if not dest:
+                            await send_caption_and_audio(
+                                "I did not catch a destination. Try saying navigate to, followed by the place name."
+                            )
+                            return
+                        if last_gps is None:
+                            await send_caption_and_audio(
+                                "I need your GPS location to navigate. "
+                                "Enable location for this app, wait a few seconds, then try again."
+                            )
+                            return
+                        if not (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip():
+                            await send_caption_and_audio(
+                                "Navigation is not configured on the server. Missing GOOGLE_MAPS_API_KEY."
+                            )
+                            return
+
+                        lat0, lon0 = last_gps
+
+                        def _start() -> None:
+                            nav.start_navigation(dest, (lat0, lon0))
+
+                        first_instr = ""
+                        nav_err: Optional[str] = None
+                        async with nav_lock:
+                            try:
+                                await asyncio.get_running_loop().run_in_executor(None, _start)
+                            except Exception as exc:
+                                print(f"[nav] start failed: {exc}")
+                                nav_err = f"I could not build a walking route. {str(exc)[:120]}"
+                            if nav_err is None and not nav.steps:
+                                nav_err = "No walking steps were returned for that destination."
+                            if nav_err is None:
+                                nav.mark_intro_announced()
+                                first_instr = nav.steps[0].instruction
+                                last_nav_ui_sent = "\n"
+                                await push_nav_ui_if_changed()
+
+                        if nav_err is not None:
+                            await send_caption_and_audio(nav_err)
+                            return
+
+                        ack = f"Okay, navigating to {dest}. First, {first_instr}."
+                        await send_caption_and_audio(ack)
+                        return
+
+                    # Default: scene question — needs a frame
                     if curr_pil is None:
                         await send({"type": "error", "message": "No frames received yet.", "data": None})
                         return
-                    print("[submit] Gemini vision+audio call")
+                    print("[submit] Gemini vision+audio (hazard Q&A)")
                     caption = await _gemini_vision_audio(curr_pil, wav_bytes, _AUDIO_PROMPT)
+                    await send_caption_and_audio(caption)
+                    return
 
-                elif latest_path:
-                    # No audio: use vlm_with_audio.analyze_image on the latest cached file
+                if latest_path:
                     print(f"[submit] vision-only call on {latest_path}")
                     caption = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: analyze_image(str(latest_path))
                     )
-
-                else:
-                    await send({"type": "error", "message": "No frames received yet.", "data": None})
+                    if not caption:
+                        print("[submit] VLM throttled or returned empty")
+                        await send({"type": "error", "message": "Too soon — try again in a moment.", "data": None})
+                        return
+                    await send_caption_and_audio(caption)
                     return
 
-                if not caption:
-                    print("[submit] VLM throttled or returned empty")
-                    await send({"type": "error", "message": "Too soon — try again in a moment.", "data": None})
-                    return
-
-                await send_caption_and_audio(caption)
+                await send({"type": "error", "message": "No frames received yet.", "data": None})
 
             except Exception as exc:
                 if _is_quota_error(exc):
@@ -371,6 +492,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_buffer.clear()
                     continue
 
+                # Signal any running frame analysis to bail so we get the lock fast
+                submit_pending = True
+
                 wav_bytes: Optional[bytes] = None
                 if len(audio_buffer) > 0:
                     wav_bytes = _pcm_float32_to_wav(bytes(audio_buffer), audio_sample_rate)
@@ -378,6 +502,15 @@ async def websocket_endpoint(websocket: WebSocket):
                     audio_buffer.clear()
 
                 asyncio.create_task(respond_submit(wav_bytes))
+
+            # ------------------------------------------------------------------
+            elif msg_type == "location":
+                try:
+                    lat = float(msg.get("lat"))
+                    lon = float(msg.get("lon"))
+                except (TypeError, ValueError):
+                    continue
+                asyncio.create_task(handle_gps_tick(lat, lon))
 
     except WebSocketDisconnect:
         print(f"[ws] disconnected  frames={frame_count}")
