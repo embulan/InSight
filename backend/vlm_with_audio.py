@@ -29,6 +29,7 @@ import sys
 import time
 import math
 import struct
+import threading
 import wave
 from pathlib import Path
 
@@ -80,6 +81,13 @@ _RETRY_DELAY_SEC    = 1.0
 
 AMBIENT_INTERVAL_SEC = 5.0
 _last_ambient_time   = 0.0
+
+# ── Frame-rate gate (Change 5) ────────────────────────────────────────────────
+LAST_RUN_TIME = 0.0
+MIN_INTERVAL  = 0.4   # seconds — skip frames arriving faster than this
+
+# ── Repeated-speech dedup (Change 6) ─────────────────────────────────────────
+LAST_SPOKEN_SET: set[str] = set()
 
 # ── Priority levels ───────────────────────────────────────────────────────────
 
@@ -300,6 +308,10 @@ class TTSEngine:
         self._el_client  = None
         self._chars_used = 0
 
+        # Initialise pygame mixer exactly once (Change 4)
+        import pygame
+        pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+
         if ELEVENLABS_API_KEY:
             try:
                 from elevenlabs.client import ElevenLabs
@@ -318,7 +330,6 @@ class TTSEngine:
 
     def _play_wav_bytes(self, wav_bytes: bytes) -> None:
         import pygame
-        pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
         sound = pygame.mixer.Sound(io.BytesIO(wav_bytes))
         sound.play()
         while pygame.mixer.get_busy():
@@ -335,6 +346,7 @@ class TTSEngine:
                 print(f"  [tone error: {e}]")
 
     def speak(self, text: str) -> None:
+        """Synthesise and start playback. Non-blocking — returns immediately after play() (Change 1)."""
         if not self._el_client:
             print(f"  [no TTS] {text}")
             return
@@ -345,18 +357,19 @@ class TTSEngine:
             audio_stream = self._el_client.text_to_speech.convert(
                 text=text,
                 voice_id=ELEVENLABS_VOICE_ID,
-                model_id="eleven_turbo_v2",
+                model_id="eleven_flash_v2_5",   # Change 7: faster model
             )
             audio_bytes = b"".join(audio_stream)
             import pygame
-            pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
             pygame.mixer.music.load(io.BytesIO(audio_bytes))
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
+            pygame.mixer.music.play()           # Change 1: no blocking wait
             self._chars_used += len(text)
         except Exception as e:
             print(f"  ElevenLabs error: {e}")
+
+    def speak_async(self, text: str) -> None:
+        """Fire-and-forget TTS on a daemon thread (Change 1)."""
+        threading.Thread(target=self.speak, args=(text,), daemon=True).start()
 
 
 # ── Gemini vision call ────────────────────────────────────────────────────────
@@ -417,7 +430,14 @@ def analyze_image(
 # ── Single frame pipeline ─────────────────────────────────────────────────────
 
 def run_frame(image_path: str | Path, tts: TTSEngine, frame_num: int = 1) -> str:
-    global _last_ambient_time
+    global _last_ambient_time, LAST_RUN_TIME, LAST_SPOKEN_SET
+
+    # Change 5: frame-rate gate — skip frames arriving too quickly
+    now = time.time()
+    if now - LAST_RUN_TIME < MIN_INTERVAL:
+        print("Skipping frame (rate limit)")
+        return ""
+    LAST_RUN_TIME = now
 
     print(f"\n{'═' * 55}")
     print(f"  Frame {frame_num}: {image_path}")
@@ -442,17 +462,33 @@ def run_frame(image_path: str | Path, tts: TTSEngine, frame_num: int = 1) -> str
         for h in hazards:
             icon = PRIORITY_ICON.get(h["priority"], "  ")
             print(f"  {icon} [{h['priority'].upper():<8}] {h['spoken']}")
-            tts.play_priority_tone(h["priority"])
-            tts.speak(h["spoken"])
+
+        # Change 6: skip hazards that were already spoken in a recent frame
+        new_hazards = []
+        for h in hazards:
+            if h["spoken"] not in LAST_SPOKEN_SET:
+                new_hazards.append(h)
+                LAST_SPOKEN_SET.add(h["spoken"])
+
+        if not new_hazards:
+            print("All hazards already spoken — skipping audio")
+        else:
+            # Change 2: one combined TTS call for the top two hazards
+            top_hazards  = new_hazards[:2]
+            combined_text = " ".join(h["spoken"] for h in top_hazards)
+            tts.play_priority_tone(top_hazards[0]["priority"])
+            tts.speak_async(combined_text)   # Change 1: non-blocking
     else:
         print("hazards detected : none — ambient")
-        now = time.time()
-        if now - _last_ambient_time >= AMBIENT_INTERVAL_SEC:
+        # Clear spoken set when scene is clear so stale hazards don't stay suppressed
+        LAST_SPOKEN_SET.clear()
+        now_t = time.time()
+        if now_t - _last_ambient_time >= AMBIENT_INTERVAL_SEC:
             print(f"  🗣  [AMBIENT  ] {result}")
-            tts.speak(result)
-            _last_ambient_time = now
+            tts.speak_async(result)          # Change 8: non-blocking ambient speech
+            _last_ambient_time = now_t
         else:
-            remaining = AMBIENT_INTERVAL_SEC - (now - _last_ambient_time)
+            remaining = AMBIENT_INTERVAL_SEC - (now_t - _last_ambient_time)
             print(f"  🗣  [AMBIENT  ] skipped — next in {remaining:.1f}s")
 
     t_end    = time.perf_counter()

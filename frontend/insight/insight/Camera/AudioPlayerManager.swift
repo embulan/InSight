@@ -6,6 +6,10 @@ final class AudioPlayerManager: NSObject {
 
     private var player: AVAudioPlayer?
 
+    /// Called on the main queue when the current clip finishes naturally
+    /// (not when stopped early via `stop()`).
+    var onPlaybackFinished: (() -> Void)?
+
     /// Play raw MP3 bytes.  Safe to call from any thread.
     func play(mp3Data: Data) {
         DispatchQueue.main.async { [weak self] in
@@ -14,6 +18,7 @@ final class AudioPlayerManager: NSObject {
     }
 
     /// Stop playback immediately.  Safe to call from any thread.
+    /// Does NOT fire onPlaybackFinished — use that only for natural completion.
     func stop() {
         DispatchQueue.main.async { [weak self] in
             self?.player?.stop()
@@ -46,6 +51,8 @@ final class AudioPlayerManager: NSObject {
 extension AudioPlayerManager: AVAudioPlayerDelegate {
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         if Config.verboseLogging { print("AudioPlayer: playback finished (success: \(flag))") }
+        self.player = nil
+        onPlaybackFinished?()
     }
 
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {

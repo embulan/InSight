@@ -6,6 +6,14 @@ struct IncomingBackendEvent: Decodable {
     let type: String
     let message: String?
     let data: String?
+    /// Highest hazard priority found in a "caption" event.
+    /// One of: "critical", "high", "medium", "ambient". Nil for non-caption events.
+    let hazardLevel: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case type, message, data
+        case hazardLevel = "hazard_level"
+    }
 }
 
 // MARK: - Outgoing

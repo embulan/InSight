@@ -124,7 +124,7 @@ struct PhoneDebugView: View {
         )
         .animation(.easeInOut(duration: 0.3), value: coordinator.state)
         .animation(.easeInOut(duration: 0.4), value: coordinator.latestCaption)
-        .onChange(of: isStreaming) { streaming in
+        .onChange(of: isStreaming) { _, streaming in
             guard streaming else { return }
             withAnimation { showGestureHint = true }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {

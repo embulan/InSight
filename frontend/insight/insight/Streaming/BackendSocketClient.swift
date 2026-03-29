@@ -14,8 +14,11 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
     private var pendingMessages: [URLSessionWebSocketTask.Message] = []
     private let decoder = JSONDecoder()
     private var isDisconnecting = false
+    private var pingTimer: Timer?
 
     var onEvent: ((IncomingBackendEvent) -> Void)?
+    /// Called when the connection drops unexpectedly (not from an explicit disconnect() call).
+    var onDisconnect: (() -> Void)?
 
     func connect(url: URL) {
         disconnect()
@@ -37,12 +40,47 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
 
     func disconnect() {
         isDisconnecting = true
+        stopPingTimer()
         pendingMessages.removeAll()
         connectionState = .disconnected
         socketTask?.cancel(with: .normalClosure, reason: nil)
         socketTask = nil
         session?.invalidateAndCancel()
         session = nil
+    }
+
+    // MARK: - Keepalive ping
+
+    private func startPingTimer() {
+        stopPingTimer()
+        // Fire every 30 s on the main run loop — well within typical NAT idle timeouts (60–90 s)
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.sendPing()
+        }
+    }
+
+    private func stopPingTimer() {
+        pingTimer?.invalidate()
+        pingTimer = nil
+    }
+
+    private func sendPing() {
+        guard connectionState == .connected, let socketTask else { return }
+        socketTask.sendPing { [weak self] error in
+            if let error {
+                print("WebSocket ping failed: \(error) — treating as disconnect")
+                self?.handleUnexpectedDisconnect()
+            }
+        }
+    }
+
+    private func handleUnexpectedDisconnect() {
+        guard !isDisconnecting else { return }
+        connectionState = .disconnected
+        stopPingTimer()
+        DispatchQueue.main.async { [weak self] in
+            self?.onDisconnect?()
+        }
     }
 
     func sendFrame(_ jpegData: Data) {
@@ -59,6 +97,20 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
             "timestampMs": now(),
             "sampleRate": Int(sampleRate),
             "pcmBase64": pcmData.base64EncodedString()
+        ])
+    }
+
+    func sendListeningStart() {
+        sendJSONObject([
+            "type": "listening_start",
+            "timestampMs": now()
+        ])
+    }
+
+    func sendAudioDone() {
+        sendJSONObject([
+            "type": "audio_done",
+            "timestampMs": now()
         ])
     }
 
@@ -120,24 +172,24 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
 
     private func receiveLoop() {
         socketTask?.receive { [weak self] result in
+            guard let self else { return }
             switch result {
             case .failure(let error):
-                self?.connectionState = .disconnected
-                if self?.isDisconnecting == false {
+                if !isDisconnecting {
                     print("WebSocket receive error: \(error)")
+                    handleUnexpectedDisconnect()
                 }
 
             case .success(let message):
                 switch message {
                 case .string(let text):
-                    self?.handleString(text)
+                    handleString(text)
                 case .data(let data):
-                    self?.handleData(data)
+                    handleData(data)
                 @unknown default:
                     break
                 }
-
-                self?.receiveLoop()
+                receiveLoop()
             }
         }
     }
@@ -174,6 +226,7 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         if Config.verboseLogging {
             print("WebSocket connected. Negotiated protocol:", `protocol` ?? "none")
         }
+        DispatchQueue.main.async { self.startPingTimer() }
         flushPendingMessages()
     }
 
@@ -183,13 +236,19 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        connectionState = .disconnected
         let wasDisconnecting = isDisconnecting
+        connectionState = .disconnected
         isDisconnecting = false
+        stopPingTimer()
         if Config.verboseLogging {
             let reasonText = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
             let closeKind = wasDisconnecting ? "client disconnect" : "remote close"
             print("WebSocket closed:", closeCode.rawValue, closeKind, "reason:", reasonText)
+        }
+        if !wasDisconnecting {
+            DispatchQueue.main.async { [weak self] in
+                self?.onDisconnect?()
+            }
         }
     }
 }

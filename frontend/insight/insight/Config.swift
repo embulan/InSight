@@ -24,7 +24,6 @@ enum Config {
     // -------------------------------------------------------------------------
 
     /// Seconds between frames sent to the backend.
-    /// 0.5 s → about 2 FPS, which keeps the stream feeling live without saturating the UI path.
     static let frameInterval: TimeInterval = 0.5
 
     /// How often (seconds) the server saves a frame to vlm_cache and runs sim_check.

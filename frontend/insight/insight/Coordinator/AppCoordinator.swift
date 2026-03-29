@@ -16,6 +16,7 @@ final class AppCoordinator: ObservableObject {
     private let socketClient = BackendSocketClient()
     private let audioManager = AudioManager()
     private let audioPlayer = AudioPlayerManager()
+    private let hazardPlayer = HazardAlertPlayer()
     private let frameProcessingQueue = DispatchQueue(label: "app.frame.processing.queue", qos: .userInitiated)
     private let audioBufferQueue = DispatchQueue(label: "app.audio.buffer.queue")
     private var bufferedAudioChunks: [Data] = []
@@ -41,6 +42,10 @@ final class AppCoordinator: ObservableObject {
         socketClient.onEvent = { [weak self] event in
             self?.handleBackendEvent(event)
         }
+
+        socketClient.onDisconnect = { [weak self] in
+            self?.handleSocketDisconnect()
+        }
     }
 
     // MARK: - Public controls (called from UI and watch)
@@ -52,8 +57,10 @@ final class AppCoordinator: ObservableObject {
         guard case .liveAssist = state else { return }
         resetBufferedAudio()
 
-        // Stop any TTS that is currently playing so it doesn't bleed into the recording
+        // Stop any TTS / hazard tone immediately and tell the server to cancel pending work
         audioPlayer.stop()
+        hazardPlayer.stop()
+        socketClient.sendListeningStart()
 
         state = .liveAssist(phase: .listening)
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.listening.rawValue)
@@ -105,6 +112,16 @@ final class AppCoordinator: ObservableObject {
         socketClient.connect(url: Config.backendWebSocketURL)
     }
 
+    private func handleSocketDisconnect() {
+        // Only reconnect if the user is actively using the app — not if they stopped assist.
+        guard isStreamingState else { return }
+        print("WebSocket dropped unexpectedly — reconnecting in 1s...")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.isStreamingState else { return }
+            self.socketClient.connect(url: Config.backendWebSocketURL)
+        }
+    }
+
     private func stopAssist() {
         audioManager.stop()
         cameraManager.stop()
@@ -138,6 +155,10 @@ final class AppCoordinator: ObservableObject {
 
         case "caption":
             guard let text = event.message, !text.isEmpty else { return }
+            // Fire the hazard tone immediately — it arrives before TTS audio.
+            if let level = event.hazardLevel {
+                hazardPlayer.play(level: level)
+            }
             DispatchQueue.main.async {
                 self.latestCaption = text
                 // Return from processing → observing once we have the caption
@@ -149,7 +170,18 @@ final class AppCoordinator: ObservableObject {
 
         case "audio":
             guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
-            audioPlayer.stop()   // cut off any previous clip before starting the new one
+            audioPlayer.stop()
+            audioPlayer.onPlaybackFinished = nil   // clear any previous hook
+            audioPlayer.play(mp3Data: mp3Data)
+
+        case "submit_audio":
+            // High-priority audio from a voice query — block frame TTS until it finishes.
+            guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
+            audioPlayer.stop()
+            audioPlayer.onPlaybackFinished = { [weak self] in
+                self?.audioPlayer.onPlaybackFinished = nil
+                self?.socketClient.sendAudioDone()
+            }
             audioPlayer.play(mp3Data: mp3Data)
 
         case "status":
