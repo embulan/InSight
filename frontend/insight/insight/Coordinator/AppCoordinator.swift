@@ -19,6 +19,7 @@ final class AppCoordinator: ObservableObject {
     private let hazardPlayer = HazardAlertPlayer()
     private let frameProcessingQueue = DispatchQueue(label: "app.frame.processing.queue", qos: .userInitiated)
     private let audioBufferQueue = DispatchQueue(label: "app.audio.buffer.queue")
+    private var pendingCaptionSpeechWorkItem: DispatchWorkItem?
     private var bufferedAudioChunks: [Data] = []
     private var bufferedAudioByteCount = 0
 
@@ -126,6 +127,9 @@ final class AppCoordinator: ObservableObject {
         audioManager.stop()
         cameraManager.stop()
         socketClient.disconnect()
+        cancelPendingCaptionSpeech()
+        audioPlayer.stop()
+        hazardPlayer.stop()
         resetBufferedAudio()
         state = .idle
         latestCaption = ""
@@ -160,6 +164,7 @@ final class AppCoordinator: ObservableObject {
                 hazardPlayer.play(level: level)
             }
             DispatchQueue.main.async {
+                self.scheduleCaptionSpeechFallback(for: text)
                 self.latestCaption = text
                 // Return from processing → observing once we have the caption
                 if case .liveAssist(phase: .processing) = self.state {
@@ -170,6 +175,7 @@ final class AppCoordinator: ObservableObject {
 
         case "audio":
             guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
+            cancelPendingCaptionSpeech()
             audioPlayer.stop()
             audioPlayer.onPlaybackFinished = nil   // clear any previous hook
             audioPlayer.play(mp3Data: mp3Data)
@@ -177,6 +183,7 @@ final class AppCoordinator: ObservableObject {
         case "submit_audio":
             // High-priority audio from a voice query — block frame TTS until it finishes.
             guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
+            cancelPendingCaptionSpeech()
             audioPlayer.stop()
             audioPlayer.onPlaybackFinished = { [weak self] in
                 self?.audioPlayer.onPlaybackFinished = nil
@@ -264,5 +271,21 @@ final class AppCoordinator: ObservableObject {
             self.bufferedAudioChunks.removeAll()
             self.bufferedAudioByteCount = 0
         }
+    }
+
+    private func scheduleCaptionSpeechFallback(for text: String) {
+        cancelPendingCaptionSpeech()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.audioPlayer.speak(text: text)
+        }
+
+        pendingCaptionSpeechWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: workItem)
+    }
+
+    private func cancelPendingCaptionSpeech() {
+        pendingCaptionSpeechWorkItem?.cancel()
+        pendingCaptionSpeechWorkItem = nil
     }
 }
