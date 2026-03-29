@@ -23,7 +23,7 @@ struct OutgoingSubmitMessage: Encodable {
     let timestampMs: Int64
 }
 
-/// Sent continuously while the mic is open (listening phase).
+/// Sent once when the user submits a recorded prompt.
 /// `pcmBase64` is mono Float32 PCM, little-endian.
 struct OutgoingAudioMessage: Encodable {
     let type = "audio"

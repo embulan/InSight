@@ -1,19 +1,25 @@
 import Foundation
 import AVFoundation
-import Combine 
+import Combine
 
 final class AppCoordinator: ObservableObject {
     static let shared = AppCoordinator()
 
     @Published var state: AssistState = .idle
+    @Published var latestCaption: String = ""
 
     private let phoneSession: PhoneSessionManager? = Config.watchConnectivityEnabled ? .shared : nil
     private let cameraManager = CameraManager()
     var cameraSession: AVCaptureSession { cameraManager.session }
-    private let frameSampler = FrameSampler(secondsBetweenFrames: 1.0 / Config.streamingFPS)
+    private let frameSampler = FrameSampler(secondsBetweenFrames: Config.frameInterval)
     private let jpegEncoder = JPEGEncoder()
     private let socketClient = BackendSocketClient()
     private let audioManager = AudioManager()
+    private let audioPlayer = AudioPlayerManager()
+    private let frameProcessingQueue = DispatchQueue(label: "app.frame.processing.queue", qos: .userInitiated)
+    private let audioBufferQueue = DispatchQueue(label: "app.audio.buffer.queue")
+    private var bufferedAudioChunks: [Data] = []
+    private var bufferedAudioByteCount = 0
 
     private init() {
         if let phoneSession {
@@ -26,37 +32,25 @@ final class AppCoordinator: ObservableObject {
             self?.handleSampleBuffer(sampleBuffer)
         }
 
-        socketClient.onEvent = { event in
-            if Config.verboseLogging { print("Backend event:", event) }
-        }
-
         audioManager.onAudioChunk = { [weak self] data in
             guard let self else { return }
             guard case .liveAssist(phase: .listening) = self.state else { return }
-            self.socketClient.sendAudio(data, sampleRate: self.audioManager.sampleRate)
+            self.appendAudioChunk(data)
+        }
+
+        socketClient.onEvent = { [weak self] event in
+            self?.handleBackendEvent(event)
         }
     }
 
-    private func handleCommand(_ command: AssistCommand) {
-        switch command {
-        case .startAssist:
-            startAssist()
-
-        case .stopAssist:
-            stopAssist()
-
-        case .enterQueryMode:
-            enterQueryMode()
-
-        case .submitRequest:
-            submitRequest()
-        }
-    }
+    // MARK: - Public controls (called from UI and watch)
 
     func startStreaming()  { startAssist() }
     func stopStreaming()   { stopAssist()  }
+
     func enterQueryMode() {
         guard case .liveAssist = state else { return }
+        resetBufferedAudio()
         state = .liveAssist(phase: .listening)
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.listening.rawValue)
 
@@ -72,27 +66,38 @@ final class AppCoordinator: ObservableObject {
         guard case .liveAssist = state else { return }
 
         audioManager.stop()
+        if let bufferedAudio = drainBufferedAudio() {
+            socketClient.sendAudio(bufferedAudio, sampleRate: audioManager.sampleRate)
+        }
         socketClient.sendSubmit()
 
         state = .liveAssist(phase: .processing)
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.processing.rawValue)
     }
 
+    // MARK: - Private
+
+    private func handleCommand(_ command: AssistCommand) {
+        switch command {
+        case .startAssist:    startAssist()
+        case .stopAssist:     stopAssist()
+        case .enterQueryMode: enterQueryMode()
+        case .submitRequest:  submitRequest()
+        }
+    }
+
     private func startAssist() {
         guard state == .idle else { return }
 
-        // Transition state immediately so the UI and watch update right away
         state = .liveAssist()
         sendWatchStatus(mode: "liveAssist", phase: AssistPhase.observing.rawValue)
 
-        // Camera — non-fatal: simulator has no camera hardware
         do {
             try cameraManager.start()
         } catch {
             print("Camera unavailable (non-fatal):", error)
         }
 
-        // Socket — connects to URL defined in Config.swift
         socketClient.connect(url: Config.backendWebSocketURL)
     }
 
@@ -100,26 +105,70 @@ final class AppCoordinator: ObservableObject {
         audioManager.stop()
         cameraManager.stop()
         socketClient.disconnect()
+        resetBufferedAudio()
         state = .idle
+        latestCaption = ""
         sendWatchStatus(mode: "idle")
     }
 
     private func handleSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard isStreamingState else { return }
         guard frameSampler.shouldSendFrame() else { return }
-        guard let jpeg = jpegEncoder.encode(sampleBuffer: sampleBuffer) else { return }
 
-        socketClient.sendFrame(jpeg)
+        frameProcessingQueue.async { [weak self] in
+            guard let self else { return }
+            guard let jpeg = self.jpegEncoder.encode(sampleBuffer: sampleBuffer) else { return }
+            self.socketClient.sendFrame(jpeg)
+        }
     }
+
+    // MARK: - Backend event handling
+
+    private func handleBackendEvent(_ event: IncomingBackendEvent) {
+        if Config.verboseLogging { print("Backend event [\(event.type)]:", event.message ?? event.data?.prefix(40) ?? "-") }
+
+        switch event.type {
+
+        case "caption":
+            guard let text = event.message, !text.isEmpty else { return }
+            DispatchQueue.main.async {
+                self.latestCaption = text
+                // Return from processing → observing once we have the caption
+                if case .liveAssist(phase: .processing) = self.state {
+                    self.state = .liveAssist(phase: .observing)
+                    self.sendWatchStatus(mode: "liveAssist", phase: AssistPhase.observing.rawValue)
+                }
+            }
+
+        case "audio":
+            guard let b64 = event.data, let mp3Data = Data(base64Encoded: b64) else { return }
+            audioPlayer.play(mp3Data: mp3Data)
+
+        case "status":
+            if Config.verboseLogging { print("Server status:", event.message ?? "") }
+
+        case "error":
+            print("Backend error:", event.message ?? "unknown")
+            DispatchQueue.main.async {
+                // Recover to observing if we were waiting for a response
+                if case .liveAssist(phase: .processing) = self.state {
+                    self.state = .liveAssist(phase: .observing)
+                }
+            }
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Walking mode (called externally when navigation response arrives)
 
     func setWalkingMode(destination: String, etaText: String) {
         state = .walking(destination: destination, etaText: etaText)
-        sendWatchStatus(
-            mode: "walking",
-            destination: destination,
-            etaText: etaText
-        )
+        sendWatchStatus(mode: "walking", destination: destination, etaText: etaText)
     }
+
+    // MARK: - Watch status helper
 
     private func sendWatchStatus(
         mode: String,
@@ -128,7 +177,6 @@ final class AppCoordinator: ObservableObject {
         etaText: String? = nil
     ) {
         guard Config.watchConnectivityEnabled else { return }
-
         phoneSession?.sendWatchStatus(
             mode: mode,
             phase: phase,
@@ -141,8 +189,40 @@ final class AppCoordinator: ObservableObject {
         switch state {
         case .idle:
             return false
-        case .liveAssist(_), .walking:
+        case .liveAssist(_), .walking(_, _):
             return true
+        }
+    }
+
+    private func appendAudioChunk(_ data: Data) {
+        audioBufferQueue.async {
+            self.bufferedAudioChunks.append(data)
+            self.bufferedAudioByteCount += data.count
+        }
+    }
+
+    private func drainBufferedAudio() -> Data? {
+        audioBufferQueue.sync {
+            guard bufferedAudioByteCount > 0 else {
+                bufferedAudioChunks.removeAll()
+                return nil
+            }
+
+            var combined = Data(capacity: bufferedAudioByteCount)
+            for chunk in bufferedAudioChunks {
+                combined.append(chunk)
+            }
+
+            bufferedAudioChunks.removeAll()
+            bufferedAudioByteCount = 0
+            return combined
+        }
+    }
+
+    private func resetBufferedAudio() {
+        audioBufferQueue.async {
+            self.bufferedAudioChunks.removeAll()
+            self.bufferedAudioByteCount = 0
         }
     }
 }

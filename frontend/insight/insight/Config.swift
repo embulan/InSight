@@ -7,22 +7,30 @@ enum Config {
     // -------------------------------------------------------------------------
 
     /// The WebSocket endpoint frames are streamed to.
-    /// Swap this out when you move from test → staging → production.
     ///
-    /// Public echo server (test): "wss://echo.websocket.org"
-    /// Local dev server:          "ws://localhost:8000/ws"
-    /// Production:                "wss://api.yourapp.com/ws"
-    static let backendWebSocketURL = URL(string: "wss://echo.websocket.org")!
+    /// Simulator : "ws://localhost:8000/ws"
+    /// Real device: "ws://<your-mac-LAN-ip>:8000/ws"
+    ///   → find your Mac's LAN IP with: System Settings → Wi-Fi → Details
+    ///   → e.g. "ws://192.168.1.42:8000/ws"
+    ///   Both phone and Mac must be on the same Wi-Fi network.
+    /// Production: "wss://api.yourapp.com/ws"
+    static let backendWebSocketURL = URL(string: "ws://10.74.219.83:8000/ws")!
 
     /// Set this when the backend requires a named WebSocket subprotocol.
     static let backendWebSocketSubprotocol: String? = nil
 
     // -------------------------------------------------------------------------
-    // MARK: Camera
+    // MARK: Frame cadence
     // -------------------------------------------------------------------------
 
-    /// Frames per second sent to the backend (lower = less bandwidth)
-    static let streamingFPS: Double = 2.0
+    /// Seconds between frames sent to the backend.
+    /// 0.5 s → about 2 FPS, which keeps the stream feeling live without saturating the UI path.
+    static let frameInterval: TimeInterval = 0.5
+
+    /// How often (seconds) the server saves a frame to vlm_cache and runs sim_check.
+    /// Keep this value in sync with CACHE_INTERVAL in backend/server.py.
+    /// For best results set it equal to frameInterval so every received frame is evaluated.
+    static let cacheInterval: TimeInterval = 0.5
 
     // -------------------------------------------------------------------------
     // MARK: Feature flags

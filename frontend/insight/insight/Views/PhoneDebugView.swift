@@ -49,6 +49,25 @@ struct PhoneDebugView: View {
                     .transition(.opacity.combined(with: .scale))
             }
 
+            // Caption overlay — appears when backend sends a description
+            if isActive && !coordinator.latestCaption.isEmpty {
+                VStack {
+                    Spacer()
+                    Text(coordinator.latestCaption)
+                        .font(.body.weight(.medium))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.black.opacity(0.65))
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 148)
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+
             // Bottom overlay — status + button
             VStack {
                 Spacer()
@@ -104,6 +123,7 @@ struct PhoneDebugView: View {
                 }
         )
         .animation(.easeInOut(duration: 0.3), value: coordinator.state)
+        .animation(.easeInOut(duration: 0.4), value: coordinator.latestCaption)
         .onChange(of: isStreaming) { streaming in
             guard streaming else { return }
             withAnimation { showGestureHint = true }

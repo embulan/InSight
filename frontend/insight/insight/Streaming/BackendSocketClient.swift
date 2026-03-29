@@ -77,7 +77,11 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
         do {
             let data = try JSONSerialization.data(withJSONObject: object, options: [])
             let text = String(decoding: data, as: UTF8.self)
-            if Config.verboseLogging { print("WebSocket send:", text) }
+            if Config.verboseLogging {
+                let type_ = object["type"] as? String ?? "?"
+                let payloadBytes = data.count
+                print("WebSocket → [\(type_)]  \(payloadBytes) bytes")
+            }
             enqueueOrSend(.string(text))
         } catch {
             print("WebSocket encode error: \(error)")
@@ -144,6 +148,10 @@ final class BackendSocketClient: NSObject, ObservableObject, URLSessionWebSocket
 
             do {
                 let event = try decoder.decode(IncomingBackendEvent.self, from: data)
+                if Config.verboseLogging {
+                    let detail = event.message ?? (event.data != nil ? "<\(event.data!.count) chars>" : "-")
+                    print("WebSocket ← [\(event.type)]  \(detail.prefix(80))")
+                }
                 onEvent?(event)
             } catch {
                 print("Backend decode error: \(error)")
