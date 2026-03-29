@@ -1,12 +1,20 @@
 """
 InSight WebSocket server.
 
-Frame cadence
--------------
-  iOS Config.frameInterval controls how often the phone sends a frame (default 20 s).
-  The server caches EVERY received frame into a per-connection FrameCache on disk.
-  scene_change_gate compares the two most-recent cached frames; if it
-  triggers and the vision lock is free, a Gemini + TTS pipeline fires.
+Frame path
+----------
+  iPhone sends one JPEG frame every Config.frameInterval seconds (default 20 s).
+  Each frame goes through backend.pipeline.run_pipeline():
+    1. sim_check  — motion-compensated scene-novelty gate (fast, no API call)
+    2. FrameCache — saves frame to per-connection temp dir on disk
+    3. VLM        — calls Gemini only when sim_check says scene changed
+  If the pipeline produced a caption, the server converts it to MP3 via
+  ElevenLabs and sends both caption text and audio bytes back to the phone.
+
+Submit path (voice query)
+-------------------------
+  Phone sends audio PCM chunks while mic is open, then a "submit" message.
+  Server calls Gemini with the latest cached frame + WAV audio, then TTS.
 
 Incoming messages from iPhone
 -------------------------------
@@ -35,8 +43,8 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import wave
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -44,56 +52,41 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from PIL import Image
 
-from backend.sim_check import scene_change_gate
+from backend.pipeline import run_pipeline
 from backend.update_image_cache import FrameCache
+from backend.vlm_with_audio import analyze_image, _get_client, MODEL
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Tuning
+# Constants
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL   = "gemini-2.5-flash"
-EL_VOICE_ID    = "JBFqnCBsd6RMkjVDRZzb"
-EL_MODEL_ID    = "eleven_flash_v2_5"
+EL_VOICE_ID  = "JBFqnCBsd6RMkjVDRZzb"
+EL_MODEL_ID  = "eleven_flash_v2_5"
+CACHE_MAX_SIZE = 3
 
-# Keep the last N frames on disk per connection (for sim_check history).
-CACHE_MAX_SIZE: int = 3
+# Seconds to pause all Gemini calls after a quota/rate-limit (429) error.
+GEMINI_COOLDOWN_SECS: float = 60.0
 
-_VISION_PROMPT = """
-You are assisting a blind or low-vision user who is walking.
 
-Identify only the most important navigation-relevant obstacles or hazards in this scene.
+def _is_quota_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "429" in s or "resource_exhausted" in s or "quota" in s or "rate" in s
 
-Prioritize:
-1. Obstacles directly ahead in the walking path
-2. Stairs, step-downs, curbs, ledges, drop-offs
-3. People, cars, bikes, or moving objects nearby
-4. Doors, poles, chairs, tables, boxes that may be bumped into
-5. Crosswalk state or traffic-related hazards if visible
-
-Keep the response to 1-3 short sentences. Mention only the main hazards.
-Include a brief location: ahead, left, right, lower-left, lower-right.
-Do not speculate.
-""".strip()
+_AUDIO_PROMPT = (
+    "You are assisting a blind or low-vision user. "
+    "Only look at the bottom 60 percent of the image. "
+    "The user has spoken a question — audio is attached. "
+    "Answer their question about what you see, prioritising navigation hazards. "
+    "Be concise (1-3 sentences)."
+)
 
 # ---------------------------------------------------------------------------
-# Lazy AI client singletons
+# ElevenLabs singleton
 # ---------------------------------------------------------------------------
 
-_gemini_client = None
 _el_client = None
-
-
-def _get_gemini():
-    global _gemini_client
-    if _gemini_client is None:
-        from google import genai
-        api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not set in .env")
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
 
 
 def _get_el():
@@ -128,40 +121,12 @@ def _pcm_float32_to_wav(pcm_bytes: bytes, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-def _prep_image(image: Image.Image) -> Image.Image:
-    img = image.copy().convert("RGB")
-    img.thumbnail((768, 768))
-    return img
-
-
 # ---------------------------------------------------------------------------
-# Blocking AI calls — run in thread pool so the event loop stays free
+# Blocking calls (run in thread pool)
 # ---------------------------------------------------------------------------
-
-def _sync_gemini_vision(image: Image.Image, prompt: str) -> str:
-    response = _get_gemini().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt, _prep_image(image)],
-    )
-    return (getattr(response, "text", None) or "").strip()
-
-
-def _sync_gemini_vision_audio(image: Image.Image, wav_bytes: bytes, prompt: str) -> str:
-    from google.genai import types
-    audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
-    combined = (
-        prompt
-        + "\n\nThe user has spoken a question — audio is attached. "
-        "Answer their question in the context of what you see."
-    )
-    response = _get_gemini().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[combined, _prep_image(image), audio_part],
-    )
-    return (getattr(response, "text", None) or "").strip()
-
 
 def _sync_tts(text: str) -> bytes:
+    """ElevenLabs TTS → raw MP3 bytes."""
     return b"".join(
         _get_el().text_to_speech.stream(
             text=text,
@@ -172,14 +137,25 @@ def _sync_tts(text: str) -> bytes:
     )
 
 
+def _sync_gemini_vision_audio(image: Image.Image, wav_bytes: bytes, prompt: str) -> str:
+    """Gemini multimodal call with both image and audio."""
+    from google.genai import types
+    img = image.copy().convert("RGB")
+    img.thumbnail((768, 768))
+    audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
+    response = _get_client().models.generate_content(
+        model=MODEL,
+        contents=[prompt, img, audio_part],
+    )
+    return (getattr(response, "text", None) or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Async wrappers
 # ---------------------------------------------------------------------------
 
-async def _gemini_vision(image: Image.Image, prompt: str) -> str:
-    return await asyncio.get_running_loop().run_in_executor(
-        None, _sync_gemini_vision, image, prompt
-    )
+async def _tts(text: str) -> bytes:
+    return await asyncio.get_running_loop().run_in_executor(None, _sync_tts, text)
 
 
 async def _gemini_vision_audio(image: Image.Image, wav_bytes: bytes, prompt: str) -> str:
@@ -188,12 +164,8 @@ async def _gemini_vision_audio(image: Image.Image, wav_bytes: bytes, prompt: str
     )
 
 
-async def _tts(text: str) -> bytes:
-    return await asyncio.get_running_loop().run_in_executor(None, _sync_tts, text)
-
-
 # ---------------------------------------------------------------------------
-# FastAPI app
+# App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="InSight Server")
@@ -208,18 +180,20 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
-    # Per-connection temp dir so concurrent connections don't share cache files
-    cache_dir = tempfile.mkdtemp(prefix="insight_ws_")
+    # Per-connection temp dir — keeps concurrent clients isolated
+    cache_dir  = tempfile.mkdtemp(prefix="insight_ws_")
     frame_cache = FrameCache(cache_dir=cache_dir, max_size=CACHE_MAX_SIZE)
     print(f"[ws] connected  cache={cache_dir}")
 
     # Per-connection state
-    curr_pil: Optional[Image.Image] = None   # latest decoded frame (always fresh)
+    curr_pil: Optional[Image.Image] = None
     frame_count: int = 0
-    audio_buffer = bytearray()
+    audio_buffer      = bytearray()
     audio_sample_rate = 44100
+    # monotonic timestamp after which Gemini calls are allowed again (0 = always allowed)
+    gemini_cooldown_until: float = 0.0
 
-    # One AI pipeline at a time per connection
+    # Prevents concurrent heavy AI calls for the same client
     vision_lock = asyncio.Lock()
 
     # -------------------------------------------------------------------------
@@ -229,34 +203,105 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception as exc:
             print(f"[ws] send error: {exc}")
 
-    async def respond(image: Image.Image, wav_bytes: Optional[bytes] = None) -> None:
-        """Gemini vision (+ optional audio) → TTS → send caption + audio."""
+    async def send_caption_and_audio(caption: str) -> None:
+        """Send caption text then TTS audio to the phone."""
+        print(f"[ai] caption → {caption[:100]}")
+        await send({"type": "caption", "message": caption, "data": None})
+        print("[ai] TTS...")
+        mp3_bytes = await _tts(caption)
+        print(f"[ai] audio ready  {len(mp3_bytes)} bytes")
+        await send({
+            "type": "audio",
+            "message": None,
+            "data": base64.b64encode(mp3_bytes).decode(),
+        })
+
+    async def respond_frame(jpeg_bytes: bytes) -> None:
+        """
+        Run the full pipeline (sim_check → cache → VLM) for a frame.
+        Only fires when vision_lock is free and cooldown has expired.
+        """
+        nonlocal gemini_cooldown_until
         async with vision_lock:
             try:
-                has_audio = bool(wav_bytes and len(wav_bytes) > 100)
-                print(f"[ai] Gemini call  has_audio={has_audio}")
-                await send({"type": "status", "message": "Processing...", "data": None})
+                await send({"type": "status", "message": "Analyzing...", "data": None})
 
-                if has_audio:
-                    caption = await _gemini_vision_audio(image, wav_bytes, _VISION_PROMPT)
-                else:
-                    caption = await _gemini_vision(image, _VISION_PROMPT)
+                # Run pipeline in thread pool — handles sim_check, cache, and Gemini
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: run_pipeline(jpeg_bytes, cache=frame_cache)
+                )
 
-                print(f"[ai] caption → {caption[:100]}")
-                await send({"type": "caption", "message": caption, "data": None})
+                sr = result["scene_result"]
+                if sr:
+                    print(
+                        f"[sim_check] novelty={sr.novelty_score:.3f}"
+                        f"  trigger={sr.should_trigger}"
+                        f"  reason={sr.debug_reason}"
+                    )
 
-                print("[ai] TTS...")
-                mp3_bytes = await _tts(caption)
-                print(f"[ai] audio ready  {len(mp3_bytes)} bytes")
-                await send({
-                    "type": "audio",
-                    "message": None,
-                    "data": base64.b64encode(mp3_bytes).decode(),
-                })
+                if not result["send_to_vlm"]:
+                    print("[pipeline] scene unchanged — no caption")
+                    return
+
+                caption = result["vlm_text"]
+                if not caption:
+                    print("[pipeline] VLM returned empty text")
+                    return
+
+                await send_caption_and_audio(caption)
 
             except Exception as exc:
-                print(f"[ai] error: {exc}")
-                await send({"type": "error", "message": str(exc)[:200], "data": None})
+                if _is_quota_error(exc):
+                    gemini_cooldown_until = time.monotonic() + GEMINI_COOLDOWN_SECS
+                    remaining = GEMINI_COOLDOWN_SECS
+                    print(f"[frame ai] quota/rate-limit — cooldown {remaining:.0f}s")
+                    await send({"type": "status", "message": f"Rate limited. Pausing {int(remaining)}s.", "data": None})
+                else:
+                    print(f"[frame ai] error: {exc}")
+                    await send({"type": "error", "message": str(exc)[:200], "data": None})
+
+    async def respond_submit(wav_bytes: Optional[bytes]) -> None:
+        """
+        Force a VLM call on the latest cached frame, including voice audio
+        if the user spoke a query.
+        """
+        nonlocal gemini_cooldown_until
+        async with vision_lock:
+            try:
+                await send({"type": "status", "message": "Processing...", "data": None})
+
+                latest_path = frame_cache.get_latest()
+
+                if wav_bytes and len(wav_bytes) > 100:
+                    # Voice query: Gemini sees image + hears audio
+                    if curr_pil is None:
+                        await send({"type": "error", "message": "No frames received yet.", "data": None})
+                        return
+                    print("[submit] Gemini vision+audio call")
+                    caption = await _gemini_vision_audio(curr_pil, wav_bytes, _AUDIO_PROMPT)
+
+                elif latest_path:
+                    # No audio: use vlm_with_audio.analyze_image on the latest cached file
+                    print(f"[submit] vision-only call on {latest_path}")
+                    caption = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: analyze_image(str(latest_path))
+                    )
+
+                else:
+                    await send({"type": "error", "message": "No frames received yet.", "data": None})
+                    return
+
+                await send_caption_and_audio(caption)
+
+            except Exception as exc:
+                if _is_quota_error(exc):
+                    gemini_cooldown_until = time.monotonic() + GEMINI_COOLDOWN_SECS
+                    remaining = GEMINI_COOLDOWN_SECS
+                    print(f"[submit ai] quota/rate-limit — cooldown {remaining:.0f}s")
+                    await send({"type": "status", "message": f"Rate limited. Pausing {int(remaining)}s.", "data": None})
+                else:
+                    print(f"[submit ai] error: {exc}")
+                    await send({"type": "error", "message": str(exc)[:200], "data": None})
 
     # -------------------------------------------------------------------------
     try:
@@ -277,40 +322,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 frame_count += 1
-                curr_pil = _jpeg_bytes_to_pil(base64.b64decode(b64))
+                jpeg_bytes = base64.b64decode(b64)
+                curr_pil   = _jpeg_bytes_to_pil(jpeg_bytes)   # always keep freshest
 
-                print(f"[frame] #{frame_count}  {len(b64)} chars  lock={'held' if vision_lock.locked() else 'free'}")
+                now = time.monotonic()
+                cooldown_left = gemini_cooldown_until - now
+                lock_held     = vision_lock.locked()
 
-                # Always cache every received frame (phone already rate-limits via frameInterval)
-                prev_paths = frame_cache.get_latest_n(1)
-                frame_cache.add_image(curr_pil)
-                print(f"[cache] saved  total={len(frame_cache)}")
+                print(
+                    f"[frame] #{frame_count}  {len(b64)} chars"
+                    f"  lock={'held' if lock_held else 'free'}"
+                    + (f"  cooldown={cooldown_left:.0f}s" if cooldown_left > 0 else "")
+                )
 
-                # Don't start a new AI call if one is already running
-                if vision_lock.locked():
-                    print("[frame] vision lock held — skipping Gemini trigger")
-                    continue
-
-                if not prev_paths:
-                    # First ever frame — describe the scene immediately
-                    print("[frame] first frame → Gemini")
-                    asyncio.create_task(respond(curr_pil))
+                if cooldown_left > 0:
+                    print(f"[frame] quota cooldown active ({cooldown_left:.0f}s left) — dropping frame")
+                elif lock_held:
+                    print("[frame] vision lock held — dropping frame")
                 else:
-                    # Run sim_check: compare previous cached frame with this one
-                    try:
-                        prev_cached_pil = Image.open(prev_paths[0]).convert("RGB")
-                        result = scene_change_gate(prev_cached_pil, curr_pil)
-                        print(
-                            f"[sim_check] novelty={result.novelty_score:.3f}"
-                            f"  trigger={result.should_trigger}"
-                            f"  reason={result.debug_reason}"
-                        )
-                        if result.should_trigger:
-                            asyncio.create_task(respond(curr_pil))
-                        else:
-                            print("[sim_check] scene unchanged — skipping Gemini")
-                    except Exception as exc:
-                        print(f"[sim_check] error: {exc}")
+                    asyncio.create_task(respond_frame(jpeg_bytes))
 
             # ------------------------------------------------------------------
             elif msg_type == "audio":
@@ -323,25 +353,28 @@ async def websocket_endpoint(websocket: WebSocket):
 
             # ------------------------------------------------------------------
             elif msg_type == "submit":
-                print(f"[submit] frame={curr_pil is not None}  audio={len(audio_buffer)} bytes")
-                if curr_pil is None:
-                    await send({"type": "error", "message": "No frames received yet.", "data": None})
+                print(f"[submit] frame={'yes' if curr_pil is not None else 'no'}  audio={len(audio_buffer)} bytes")
+
+                cooldown_left = gemini_cooldown_until - time.monotonic()
+                if cooldown_left > 0:
+                    print(f"[submit] quota cooldown active ({cooldown_left:.0f}s left) — dropping submit")
+                    await send({"type": "status", "message": f"Rate limited. Try again in {int(cooldown_left)}s.", "data": None})
+                    audio_buffer.clear()
                     continue
 
                 wav_bytes: Optional[bytes] = None
                 if len(audio_buffer) > 0:
                     wav_bytes = _pcm_float32_to_wav(bytes(audio_buffer), audio_sample_rate)
-                    print(f"[submit] {len(audio_buffer)} PCM bytes → {len(wav_bytes)} WAV bytes")
+                    print(f"[submit] converted {len(audio_buffer)} PCM bytes → {len(wav_bytes)} WAV bytes")
                     audio_buffer.clear()
 
-                asyncio.create_task(respond(curr_pil, wav_bytes))
+                asyncio.create_task(respond_submit(wav_bytes))
 
     except WebSocketDisconnect:
-        print(f"[ws] disconnected  frames={frame_count}  cache={cache_dir}")
+        print(f"[ws] disconnected  frames={frame_count}")
     except Exception as exc:
         print(f"[ws] unexpected error: {exc}")
     finally:
-        # Clean up this connection's disk cache
         frame_cache.clear()
         shutil.rmtree(cache_dir, ignore_errors=True)
         print(f"[ws] cache cleaned up: {cache_dir}")

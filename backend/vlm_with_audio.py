@@ -47,6 +47,10 @@ def analyze_image(image_path, prompt=DEFAULT_PROMPT, model=MODEL, max_retries=_M
         except (FileNotFoundError, RuntimeError):
             raise
         except Exception as exc:
+            err_str = str(exc)
+            # Never retry quota/rate-limit errors — retrying immediately makes it worse
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+                raise RuntimeError(f"Gemini quota exceeded: {exc}") from exc
             if attempt < max_retries - 1:
                 time.sleep(_RETRY_DELAY_SEC)
             else:
