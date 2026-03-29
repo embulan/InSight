@@ -8,8 +8,13 @@ Priority levels:
   MEDIUM    - soft chime + short alert         (e.g. "Door ahead.")
   AMBIENT   - no sound effect, TTS description spoken every ~5 seconds
 
+Usage:
+  python vlm_with_audio.py                           # single image: test-image2.jpg
+  python vlm_with_audio.py img1.jpg img2.jpg ...     # multiple images in sequence
+  python vlm_with_audio.py --loop img1.jpg img2.jpg  # loop continuously
+
 Setup:
-    pip install google-genai elevenlabs pillow python-dotenv pygame numpy
+    pip install google-genai elevenlabs pillow python-dotenv pygame
 
 Keys needed in .env:
     GEMINI_API_KEY     - https://aistudio.google.com/app/apikey
@@ -20,6 +25,7 @@ from __future__ import annotations
 
 import io
 import os
+import sys
 import time
 import math
 import struct
@@ -61,11 +67,10 @@ _DEFAULT_TIMEOUT_MS = 120_000
 _MAX_RETRIES        = 3
 _RETRY_DELAY_SEC    = 1.0
 
-AMBIENT_INTERVAL_SEC = 5.0   # how often ambient descriptions are spoken
+AMBIENT_INTERVAL_SEC = 5.0
 _last_ambient_time   = 0.0
 
-
-# Priority levels
+# ── Priority levels ───────────────────────────────────────────────────────────
 
 CRITICAL = "critical"
 HIGH     = "high"
@@ -73,91 +78,85 @@ MEDIUM   = "medium"
 AMBIENT  = "ambient"
 
 PRIORITY_ORDER = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, AMBIENT: 3}
+PRIORITY_ICON  = {CRITICAL: "🚨", HIGH: "⚠️ ", MEDIUM: "🔔", AMBIENT: "🗣 "}
 
+# ── Hazard keyword library ────────────────────────────────────────────────────
+# Each entry: (trigger_words, alert_text, priority)
+# ALL trigger_words must appear anywhere in the description to match.
 
-# ── Hazard library ────────────────────────────────────────────────────────────
-# phrase → (short spoken alert, priority)
-
-# HAZARD_LIBRARY: dict[str, tuple[str, str]] = {
-#     # CRITICAL — alarm sound + stern alert
-#     "step down":        ("Step down ahead!",          CRITICAL),
-#     "step up":          ("Step up ahead!",            CRITICAL),
-#     "curb":             ("Curb ahead!",               CRITICAL),
-#     "stairs":           ("Stairs ahead!",             CRITICAL),
-#     "obstacle ahead":   ("Obstacle ahead!",           CRITICAL),
-#     "wet floor":        ("Wet floor!",                CRITICAL),
-#     "car ahead":        ("Car ahead!",                CRITICAL),
-#     "car approaching":  ("Stop! - Car approaching",   CRITICAL),
-#     "crossing traffic": ("Stop! - Traffic crossing",  CRITICAL),
-#     "low ceiling":      ("Low ceiling ahead!",        CRITICAL),
-#     "drop":             ("Drop-off ahead!",           CRITICAL),
-
-#     # HIGH — soft alert tone + short alert
-#     "bicycle":          ("Bicycle nearby.",           HIGH),
-#     "cyclist":          ("Cyclist nearby.",           HIGH),
-#     "person ahead":     ("Person ahead.",             HIGH),
-#     "person approaching": ("Person approaching.",     HIGH),
-#     "scooter":          ("Scooter nearby.",           HIGH),
-#     "dog":              ("Dog nearby.",               HIGH),
-
-#     # MEDIUM — soft chime + short alert
-#     "door":             ("Door ahead.",               MEDIUM),
-#     "pole":             ("Pole ahead.",               MEDIUM),
-#     "bollard":          ("Bollard ahead.",            MEDIUM),
-#     "chair":            ("Chair in path.",            MEDIUM),
-#     "table":            ("Table in path.",            MEDIUM),
-#     "shopping cart":    ("Shopping cart ahead.",      MEDIUM),
-#     "construction":     ("Construction nearby.",      MEDIUM),
-#     "sign":             ("Sign in path.",             MEDIUM),
-# }
 HAZARD_KEYWORDS: list[tuple[list[str], str, str]] = [
-    # (trigger words — ALL must appear, alert, priority)
-    (["car", "ahead"],       "Car ahead!",              CRITICAL),
-    (["car", "approaching"], "Car approaching — stop!", CRITICAL),
-    (["car", "towards"],     "Car approaching — stop!", CRITICAL),
-    (["vehicle", "ahead"],   "Vehicle ahead!",          CRITICAL),
-    (["vehicle", "approaching"], "Vehicle approaching!", CRITICAL),
-    (["truck", "ahead"],     "Truck ahead!",            CRITICAL),
-    (["motorcycle"],         "Motorcycle ahead!",       CRITICAL),
-    (["step", "down"],       "Step down ahead!",        CRITICAL),
-    (["step", "up"],         "Step up ahead!",          CRITICAL),
-    (["curb"],               "Curb ahead!",             CRITICAL),
-    (["stair"],              "Stairs ahead!",           CRITICAL),
-    (["wet", "floor"],       "Wet floor!",              CRITICAL),
-    (["low", "ceiling"],     "Low ceiling ahead!",      CRITICAL),
-    (["drop"],               "Drop-off ahead!",         CRITICAL),
-    (["bicycle"],            "Bicycle nearby.",         HIGH),
-    (["cyclist"],            "Cyclist nearby.",         HIGH),
-    (["person", "ahead"],    "Person ahead.",           HIGH),
-    (["person", "approaching"], "Person approaching.",  HIGH),
-    (["scooter"],            "Scooter nearby.",         HIGH),
-    (["dog"],                "Dog nearby.",             HIGH),
-    (["door"],               "Door ahead.",             MEDIUM),
-    (["pole"],               "Pole ahead.",             MEDIUM),
-    (["bollard"],            "Bollard ahead.",          MEDIUM),
-    (["shopping", "cart"],   "Shopping cart ahead.",    MEDIUM),
-    (["construction"],       "Construction nearby.",    MEDIUM),
+    # ── CRITICAL ──────────────────────────────────────────────────────────────
+    (["car"],                   "Car in your path!",           CRITICAL),
+    (["vehicle"],               "Vehicle ahead!",              CRITICAL),
+    (["truck"],                 "Truck ahead!",                CRITICAL),
+    (["bus"],                   "Bus ahead!",                  CRITICAL),
+    (["motorcycle"],            "Motorcycle ahead!",           CRITICAL),
+    (["step", "down"],          "Step down ahead!",            CRITICAL),
+    (["step", "up"],            "Step up ahead!",              CRITICAL),
+    (["curb"],                  "Curb ahead!",                 CRITICAL),
+    (["stair"],                 "Stairs ahead!",               CRITICAL),
+    (["wet", "floor"],          "Wet floor!",                  CRITICAL),
+    (["low", "ceiling"],        "Low ceiling ahead!",          CRITICAL),
+    (["drop"],                  "Drop-off ahead!",             CRITICAL),
+    (["traffic"],               "Traffic — stop!",             CRITICAL),
+    # ── HIGH ──────────────────────────────────────────────────────────────────
+    (["bicycle"],               "Bicycle nearby.",             HIGH),
+    (["bike"],                  "Bike nearby.",                HIGH),
+    (["cyclist"],               "Cyclist nearby.",             HIGH),
+    (["pedestrian"],            "Pedestrian ahead.",           HIGH),
+    (["person"],                "Person ahead.",               HIGH),
+    (["people"],                "People ahead.",               HIGH),
+    (["scooter"],               "Scooter nearby.",             HIGH),
+    (["dog"],                   "Dog nearby.",                 HIGH),
+    (["runner"],                "Runner nearby.",              HIGH),
+    (["crowd"],                 "Crowd ahead.",                HIGH),
+    # ── MEDIUM ────────────────────────────────────────────────────────────────
+    (["door"],                  "Door ahead.",                 MEDIUM),
+    (["pole"],                  "Pole ahead.",                 MEDIUM),
+    (["bollard"],               "Bollard ahead.",              MEDIUM),
+    (["shopping", "cart"],      "Shopping cart ahead.",        MEDIUM),
+    (["construction"],          "Construction nearby.",        MEDIUM),
+    (["chair"],                 "Chair in path.",              MEDIUM),
+    (["table"],                 "Table in path.",              MEDIUM),
+    (["bench"],                 "Bench ahead.",                MEDIUM),
+    (["sign"],                  "Sign in path.",               MEDIUM),
+    (["rock"],                  "Rock in path.",               MEDIUM),
+    (["barrier"],               "Barrier ahead.",              MEDIUM),
+    (["cone"],                  "Cone in path.",               MEDIUM),
 ]
 
+
+# ── Hazard matching ───────────────────────────────────────────────────────────
+
 def find_hazards(description: str) -> list[tuple[str, str, str]]:
+    """
+    Returns ALL matched hazards sorted critical → high → medium.
+    Each entry: (matched keywords string, alert text, priority)
+    Deduplicates by alert text so the same warning isn't repeated.
+    """
     text = description.lower()
     found = []
-    seen_alerts = set()
+    seen_alerts: set[str] = set()
+
     for keywords, alert, priority in HAZARD_KEYWORDS:
-        if all(kw in text for kw in keywords) and alert not in seen_alerts:
-            found.append((keywords[0], alert, priority))
+        if alert in seen_alerts:
+            continue
+        if all(kw in text for kw in keywords):
+            found.append((", ".join(keywords), alert, priority))
             seen_alerts.add(alert)
+
+    # Sort: critical first, then high, then medium
     found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
     return found
 
 
-# ── Synthesised sound effects (no audio files needed) ────────────────────────
+# ── Synthesised sound effects (no files needed) ───────────────────────────────
 
-def _make_wav_bytes(frames: bytes, sample_rate: int = 44100, n_channels: int = 1, sampwidth: int = 2) -> bytes:
+def _make_wav_bytes(frames: bytes, sample_rate: int = 44100) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(n_channels)
-        wf.setsampwidth(sampwidth)
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(frames)
     return buf.getvalue()
@@ -168,7 +167,6 @@ def _sine_wave(freq: float, duration: float, amplitude: float, sample_rate: int 
     frames = b""
     for i in range(n):
         t = i / sample_rate
-        # Fade out last 10% to avoid clicks
         fade = 1.0 if i < n * 0.9 else (n - i) / (n * 0.1)
         val = int(amplitude * fade * math.sin(2 * math.pi * freq * t))
         frames += struct.pack("<h", max(-32767, min(32767, val)))
@@ -176,31 +174,22 @@ def _sine_wave(freq: float, duration: float, amplitude: float, sample_rate: int 
 
 
 def make_critical_alarm() -> bytes:
-    """Urgent two-tone alarm."""
-    sr = 44100
-    amp = 28000
-    tone1 = _sine_wave(880, 0.18, amp, sr)   # high A
-    tone2 = _sine_wave(660, 0.18, amp, sr)   # E
-    silence = b"\x00\x00" * int(sr * 0.06)
-    pattern = tone1 + silence + tone2 + silence
-    return _make_wav_bytes(pattern * 2, sr)   # repeat twice
+    sr, amp = 44100, 28000
+    t1  = _sine_wave(880, 0.18, amp, sr)
+    t2  = _sine_wave(660, 0.18, amp, sr)
+    sil = b"\x00\x00" * int(sr * 0.06)
+    return _make_wav_bytes((t1 + sil + t2 + sil) * 2, sr)
 
 
 def make_high_tone() -> bytes:
-    """Single mid-pitched ping."""
-    sr = 44100
-    frames = _sine_wave(520, 0.25, 18000, sr)
-    return _make_wav_bytes(frames, sr)
+    return _make_wav_bytes(_sine_wave(520, 0.25, 18000), 44100)
 
 
 def make_medium_chime() -> bytes:
-    """Soft low chime."""
-    sr = 44100
-    frames = _sine_wave(380, 0.3, 10000, sr)
-    return _make_wav_bytes(frames, sr)
+    return _make_wav_bytes(_sine_wave(380, 0.3, 10000), 44100)
 
 
-# ── TTS engine
+# ── TTS engine ────────────────────────────────────────────────────────────────
 
 class TTSEngine:
     def __init__(self):
@@ -217,7 +206,6 @@ class TTSEngine:
         else:
             print("TTS: no ELEVENLABS_API_KEY in .env")
 
-        # Pre-generate sound effect bytes once
         self._sounds: dict[str, bytes] = {
             CRITICAL: make_critical_alarm(),
             HIGH:     make_high_tone(),
@@ -233,7 +221,6 @@ class TTSEngine:
             time.sleep(0.01)
 
     def play_priority_tone(self, priority: str) -> None:
-        """Play the sound effect for a given priority level. AMBIENT = silent."""
         if priority == AMBIENT:
             return
         wav = self._sounds.get(priority)
@@ -323,88 +310,87 @@ def analyze_image(
                 raise RuntimeError(f"Gemini failed after {max_retries} attempt(s): {exc}") from exc
 
 
-# ── Hazard matching ───────────────────────────────────────────────────────────
+# ── Single frame pipeline ─────────────────────────────────────────────────────
 
-# def find_hazards(description: str) -> list[tuple[str, str, str]]:
-#     """
-#     Returns list of (phrase, alert_text, priority) found in description,
-#     sorted critical → high → medium.
-#     """
-#     text = description.lower()
-#     found = []
-#     seen_alerts = set()
-#     for phrase, (alert, priority) in HAZARD_LIBRARY.items():
-#         if phrase in text and alert not in seen_alerts:
-#             found.append((phrase, alert, priority))
-#             seen_alerts.add(alert)
-#     found.sort(key=lambda x: PRIORITY_ORDER.get(x[2], 9))
-#     return found
-
-
-# ── Main pipeline ─────────────────────────────────────────────────────────────
-
-def run(image_path: str | Path, prompt: str = DEFAULT_PROMPT) -> str:
+def run_frame(image_path: str | Path, tts: TTSEngine, frame_num: int = 1) -> str:
     global _last_ambient_time
 
-    tts = TTSEngine()
+    print(f"\n{'═' * 55}")
+    print(f"  Frame {frame_num}: {image_path}")
+    print(f"{'═' * 55}")
 
-    print(f"\nmodel  : {MODEL}")
-    print(f"image  : {image_path}")
-    print("─" * 50)
-
-    # ── Timing: VLM call
-    t_start       = time.perf_counter()
-    t_vlm_start   = t_start
-    result        = analyze_image(image_path, prompt)
-    t_vlm_end     = time.perf_counter()
-    vlm_ms        = (t_vlm_end - t_vlm_start) * 1000
+    t_start   = time.perf_counter()
+    result    = analyze_image(image_path)
+    t_vlm_end = time.perf_counter()
+    vlm_ms    = (t_vlm_end - t_start) * 1000
 
     print(f"VLM latency      : {vlm_ms:.1f} ms")
     print(f"result           : {result}")
-    print("─" * 50)
+    print("─" * 55)
 
-    # ── Hazard detection
     hazards = find_hazards(result)
 
-    if hazards:
-        print(f"hazards detected : {[h[0] for h in hazards]}")
-    else:
-        print("hazards detected : none — ambient description")
-
-    # ── Audio: play tones + speak alerts for hazards
     t_audio_start = time.perf_counter()
 
     if hazards:
+        print(f"hazards detected : {len(hazards)}")
         for phrase, alert, priority in hazards:
-            print(f"  [{priority.upper():<8}] 🔊 {alert}")
-            tts.play_priority_tone(priority)   # sound effect first
-            tts.speak(alert)                   # then stern short alert
+            icon = PRIORITY_ICON.get(priority, "  ")
+            print(f"  {icon} [{priority.upper():<8}] {alert}  (matched: '{phrase}')")
+            tts.play_priority_tone(priority)
+            tts.speak(alert)
     else:
-        # No hazards — ambient: speak full description on interval
+        print("hazards detected : none — ambient")
         now = time.time()
         if now - _last_ambient_time >= AMBIENT_INTERVAL_SEC:
-            print(f"  [AMBIENT  ] 🗣  {result}")
+            print(f"  🗣  [AMBIENT  ] {result}")
             tts.speak(result)
             _last_ambient_time = now
         else:
             remaining = AMBIENT_INTERVAL_SEC - (now - _last_ambient_time)
-            print(f"  [AMBIENT  ] skipped — next in {remaining:.1f}s")
+            print(f"  🗣  [AMBIENT  ] skipped — next in {remaining:.1f}s")
 
-    t_audio_end = time.perf_counter()
-    audio_ms    = (t_audio_end - t_audio_start) * 1000
-    total_ms    = (t_audio_end - t_start) * 1000
+    t_end    = time.perf_counter()
+    audio_ms = (t_end - t_audio_start) * 1000
+    total_ms = (t_end - t_start) * 1000
 
-    print("─" * 50)
+    print("─" * 55)
+    print(f"VLM latency      : {vlm_ms:.1f} ms")
     print(f"audio latency    : {audio_ms:.1f} ms")
     print(f"TOTAL latency    : {total_ms:.1f} ms")
 
     return result
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main() -> None:
-    import sys
-    image_arg = sys.argv[1] if len(sys.argv) > 1 else "test-image2.jpg"
-    run(image_arg)
+    args = sys.argv[1:]
+
+    loop_mode = "--loop" in args
+    if loop_mode:
+        args = [a for a in args if a != "--loop"]
+
+    images = args if args else ["test-image2.jpg"]
+
+    tts = TTSEngine()
+
+    if loop_mode:
+        print(f"Looping over {len(images)} image(s) continuously — Ctrl+C to stop.")
+        frame = 1
+        try:
+            while True:
+                for img in images:
+                    run_frame(img, tts, frame_num=frame)
+                    frame += 1
+                    time.sleep(0.3)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        for i, img in enumerate(images, 1):
+            run_frame(img, tts, frame_num=i)
+            if i < len(images):
+                time.sleep(0.3)
 
 
 if __name__ == "__main__":
